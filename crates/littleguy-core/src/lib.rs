@@ -7,6 +7,7 @@ pub mod addr;
 pub mod config;
 pub mod ids;
 pub mod mandate_bridge;
+pub mod orchestration;
 pub mod pairing;
 pub mod route;
 
@@ -21,6 +22,16 @@ pub use mandate_bridge::{
     BiscuitMandateClaims, ConstitutionalSealedAction, ESTATE_TRUST_DOMAIN, MandateBridgeError,
     REJECTED_SPLIT_HORIZON_DOMAINS, ReversibilityClass, SandboxClass, SpiffeAgentIdentity,
     SpiffePathFamily,
+};
+pub use orchestration::{
+    AgentEffect, AuthorityGrant, AuthorityViolation, CompensationPlan, DomainGatePolicy,
+    EffectKind, EffectProvenance, EscapementLeaseState, EscapementPoolClass,
+    EscapementPoolDispatcher, EscapementPoolTask, EscapementTaskKind, EscapementTaskSpec,
+    EstateSubject, LittleguySeatSlot, LittleguySeatSubstrate, MeshDomainKind, SeatId, SeatJobSpec,
+    SeatJobState, SeatLiveness, SeatReceipt, SeatSubstrateError, TripwireRegistry, WebMcpManifest,
+    WebMcpToolDescriptor, WheelhorseActionDescriptor, WheelhorseActionKind, WheelhorseGate,
+    WheelhorseGateDecision, WheelhorseGateRecord, derive_queue_item_id, is_red_gated_repo,
+    resolve_domain_gate_policy,
 };
 pub use pairing::{PairingCode, Pending, PendingPairings};
 pub use route::{ChannelRule, Decision, Inbound, Route, Routing, decide, route};
