@@ -66,6 +66,8 @@ fn clippy() -> Result<()> {
         "--workspace",
         "--all-targets",
         "--locked",
+        "-j",
+        "2",
         "--",
         "-D",
         "warnings",
@@ -73,7 +75,7 @@ fn clippy() -> Result<()> {
 }
 
 fn test() -> Result<()> {
-    cargo(&["test", "--workspace", "--locked"])
+    cargo(&["test", "--workspace", "--locked", "-j", "2"])
 }
 
 /// The arguments of the coverage run. The xtask crate is excluded: it drives

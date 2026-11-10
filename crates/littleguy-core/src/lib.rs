@@ -6,6 +6,7 @@
 pub mod addr;
 pub mod config;
 pub mod ids;
+pub mod mandate_bridge;
 pub mod pairing;
 pub mod route;
 
@@ -16,6 +17,11 @@ pub use config::{
     ToolsConfig, chat_user, discord_sender, slack_sender,
 };
 pub use ids::{ChannelId, IdError, MessageId, OwnerName, SenderId};
+pub use mandate_bridge::{
+    BiscuitMandateClaims, ConstitutionalSealedAction, ESTATE_TRUST_DOMAIN, MandateBridgeError,
+    REJECTED_SPLIT_HORIZON_DOMAINS, ReversibilityClass, SandboxClass, SpiffeAgentIdentity,
+    SpiffePathFamily,
+};
 pub use pairing::{PairingCode, Pending, PendingPairings};
 pub use route::{ChannelRule, Decision, Inbound, Route, Routing, decide, route};
 

@@ -24,6 +24,7 @@ mod chats;
 mod client;
 mod daemon;
 mod guard;
+pub mod mandate_bridge;
 mod memory;
 mod oauth;
 mod pairs;

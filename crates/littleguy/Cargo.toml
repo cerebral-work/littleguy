@@ -14,9 +14,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 axum = "0.8"
-autumn-harvest = { version = "0.10", features = ["sandbox-activities"] }
+autumn-harvest = { workspace = true, features = ["sandbox-activities"] }
 autumn-harvest-agent = { workspace = true, features = ["sandbox"] }
-autumn-harvest-plugin = { version = "0.10", default-features = false, features = ["connectors"] }
+autumn-harvest-plugin = { workspace = true }
 autumn-harvest-sqlite = { workspace = true }
 camel-api = "0.57"
 chrono = "0.4"

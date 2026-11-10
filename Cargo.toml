@@ -23,8 +23,11 @@ littleguy-core = { version = "0.1.0", path = "crates/littleguy-core" }
 littleguy-models = { version = "0.1.0", path = "crates/littleguy-models" }
 littleguy-stores = { version = "0.1.0", path = "crates/littleguy-stores" }
 littleguy-tools = { version = "0.1.0", path = "crates/littleguy-tools" }
+autumn-harvest = "0.10.0"
 autumn-harvest-agent = { version = "0.10.0", features = ["sqlite"] }
+autumn-harvest-plugin = { version = "0.10.0", default-features = false, features = ["connectors"] }
 autumn-harvest-sqlite = "0.10.0"
+rusqlite = { version = "0.40", features = ["bundled"] }
 anyhow = "1"
 clap = { version = "4.6", features = ["derive", "env"] }
 proptest = "1"
