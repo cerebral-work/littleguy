@@ -466,3 +466,546 @@ mod approvals {
         assert_eq!(stores.approval(id).unwrap().unwrap().tool, "run_code");
     }
 }
+
+mod reverie_adapter {
+    use std::collections::BTreeSet;
+
+    use autumn_harvest_agent::ErrorKind;
+    use autumn_harvest_agent::episode::{EpisodeStore, PassMark};
+    use autumn_harvest_agent::memory::{EditKey, MemoryOp, MemoryScope, MemoryStore};
+    use serde_json::json;
+
+    use super::{add, episode, remove};
+    use crate::{
+        AdapterError, HttpMethod, MockHttpTransport, ReverieClientConfig,
+        ReverieObservationBuilder, ReverieObservationKind, ReverieObservationStore, ReverieScope,
+        ReverieSearchQuery, ReverieWriteMode, StoreHttpResponse, validate_topic_key,
+    };
+
+    #[test]
+    fn config_and_topic_key_validation_rejects_malformed_inputs() {
+        assert!(ReverieClientConfig::new("ftp://127.0.0.1:7437", "littleguy").is_err());
+        assert!(
+            ReverieClientConfig::new("http://user:secret@127.0.0.1:7437", "littleguy").is_err()
+        );
+        assert!(ReverieClientConfig::new("http://127.0.0.1:7437?bad=1", "littleguy").is_err());
+        assert!(ReverieClientConfig::localhost_default("  ").is_err());
+        assert!(
+            ReverieClientConfig::localhost_default("littleguy")
+                .unwrap()
+                .with_smart_context_limit(0)
+                .is_err()
+        );
+
+        for invalid_topic in [
+            "",
+            "single",
+            "/leading/slash",
+            "trailing/slash/",
+            "littleguy/../escape",
+            "Upper/Case",
+            "space in/key",
+        ] {
+            assert!(
+                validate_topic_key(invalid_topic).is_err(),
+                "expected invalid topic_key `{invalid_topic}` to fail"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_smart_context_and_observation_builder_encode_without_interpolation() {
+        let cfg = ReverieClientConfig::localhost_default("littleguy")
+            .unwrap()
+            .with_scope(ReverieScope::Project)
+            .with_smart_context_limit(20)
+            .unwrap()
+            .with_agent_id("spiffe://unsigned.gg/agent/platform/lg-01")
+            .unwrap()
+            .with_subject("memory-knowledge")
+            .unwrap();
+        let mock = MockHttpTransport::new();
+        let store = ReverieObservationStore::open_in_memory(cfg, mock.clone()).unwrap();
+
+        mock.enqueue_json(
+            200,
+            &json!({
+                "results": [{
+                    "id": 101,
+                    "title": "Mandate note",
+                    "content": "spiffe://unsigned.gg",
+                    "project": "littleguy",
+                    "topic_key": "architecture/mandate",
+                    "tags": [{"facet": "FlowLabel", "value": "untrusted_input"}]
+                }]
+            }),
+        )
+        .unwrap();
+
+        let search_query = ReverieSearchQuery::new("a&project=injected#frag?x=1")
+            .with_scope(ReverieScope::Project)
+            .with_topic_prefix("architecture/mandate")
+            .with_limit(5);
+        let hits = store.search(&search_query).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].flow_labels(),
+            BTreeSet::from([String::from("untrusted_input")])
+        );
+
+        mock.enqueue_json(
+            200,
+            &json!({
+                "project": "littleguy",
+                "context": "## Recent Decisions\n- Mandate active",
+                "observations": []
+            }),
+        )
+        .unwrap();
+        let smart = store.smart_context(None, None).await.unwrap();
+        assert!(smart.context.contains("Mandate active"));
+
+        let recorded = mock.recorded_requests();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].method, HttpMethod::Get);
+        assert_eq!(recorded[0].url.path(), "/search");
+        let pairs: Vec<(String, String)> = recorded[0].url.query_pairs().into_owned().collect();
+        assert!(pairs.contains(&(
+            String::from("q"),
+            String::from("a&project=injected#frag?x=1")
+        )));
+        assert!(pairs.contains(&(String::from("project"), String::from("littleguy"))));
+        assert_eq!(recorded[0].url.fragment(), None);
+
+        assert_eq!(recorded[1].url.path(), "/context/smart");
+        let ctx_pairs: Vec<(String, String)> = recorded[1].url.query_pairs().into_owned().collect();
+        assert!(ctx_pairs.contains(&(String::from("project"), String::from("littleguy"))));
+        assert!(ctx_pairs.contains(&(String::from("limit"), String::from("20"))));
+        assert!(ctx_pairs.contains(&(String::from("subject"), String::from("memory-knowledge"))));
+
+        let built = ReverieObservationBuilder::new(
+            "littleguy",
+            "architecture/wave2-stores",
+            "Wave 2 store layout",
+            "Pluggable HTTP transport isolates offline tests.",
+        )
+        .kind(ReverieObservationKind::Architecture)
+        .write_mode(ReverieWriteMode::Upsert)
+        .evidence_link("specs/0003")
+        .build()
+        .unwrap();
+        mock.enqueue_json(
+            201,
+            &json!({"id": 202, "topic_key": "architecture/wave2-stores"}),
+        )
+        .unwrap();
+        let receipt = store.save_observation(&built).await.unwrap();
+        assert_eq!(
+            receipt.topic_key.as_deref(),
+            Some("architecture/wave2-stores")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_and_episode_stores_enforce_edit_key_idempotency_retry_and_taint() {
+        let cfg = ReverieClientConfig::localhost_default("littleguy").unwrap();
+        let mock = MockHttpTransport::new();
+        let store = ReverieObservationStore::open_in_memory(cfg, mock.clone()).unwrap();
+        let sc = MemoryScope::new("agent:assistant/mark");
+
+        // 1. Transient HTTP 503 fails with Unavailable and does NOT consume the EditKey.
+        mock.enqueue(Ok(StoreHttpResponse::new(
+            503,
+            b"reveried restarting".to_vec(),
+        )));
+        let labels = BTreeSet::from([String::from("untrusted_input")]);
+        let transient_err = store
+            .apply_labelled(&sc, add("secret-note-alpha"), &EditKey::new("m1"), &labels)
+            .await
+            .unwrap_err();
+        assert_eq!(transient_err.kind(), ErrorKind::Unavailable);
+
+        // 2. Retry with the SAME EditKey succeeds once Reverie recovers (`200 OK`).
+        let block = store
+            .apply_labelled(&sc, add("secret-note-alpha"), &EditKey::new("m1"), &labels)
+            .await
+            .unwrap();
+        assert_eq!(block.entries, vec![String::from("secret-note-alpha")]);
+        assert!(!format!("{store:?}").contains("secret-note-alpha"));
+
+        let count_after_success = mock.recorded_requests().len();
+        assert_eq!(count_after_success, 2);
+        let synced_json = mock.recorded_requests()[1].parse_json_body().unwrap();
+        assert_eq!(synced_json["project"], "littleguy");
+        assert_eq!(
+            synced_json["topic_key"],
+            "littleguy/memory/agent-assistant-mark/memory"
+        );
+        assert!(
+            synced_json["tags"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"facet": "FlowLabel", "value": "untrusted_input"}))
+        );
+
+        // 3. Replaying EditKey `m1` returns cached result with ZERO new HTTP requests.
+        let replay = store
+            .apply_labelled(&sc, add("secret-note-alpha"), &EditKey::new("m1"), &labels)
+            .await
+            .unwrap();
+        assert_eq!(replay, block);
+        assert_eq!(mock.recorded_requests().len(), count_after_success);
+
+        // 4. Invalid memory edit (`Tool` error) caches failure locally with ZERO HTTP requests.
+        let bad_op = MemoryOp::Add {
+            block: String::from("missing_block"),
+            text: String::from("x"),
+        };
+        let err1 = store
+            .apply(&sc, bad_op.clone(), &EditKey::new("bad-1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err1.kind(), ErrorKind::Tool);
+        assert_eq!(mock.recorded_requests().len(), count_after_success);
+        let _ = remove("unused");
+
+        // 5. EpisodeStore append, mark, and clear sync once per EditKey.
+        mock.clear_recorded();
+        let mut ep = episode("ep-1");
+        ep.labels.insert(String::from("private_data"));
+        let a1 = store
+            .append(&sc, &EditKey::new("ea-1"), ep.clone(), 10)
+            .await
+            .unwrap();
+        let a1_retry = store
+            .append(&sc, &EditKey::new("ea-1"), ep, 10)
+            .await
+            .unwrap();
+        assert_eq!(a1, a1_retry);
+        assert_eq!(mock.recorded_requests().len(), 1);
+
+        let mark = PassMark {
+            key: EditKey::new("pm-1"),
+            generation: 0,
+            episodes: vec![String::from("ep-1")],
+            dropped: 0,
+            facts: vec![String::from("Mark prefers concise diffs")],
+        };
+        assert!(store.mark(&sc, mark.clone()).await.unwrap());
+        assert!(store.mark(&sc, mark).await.unwrap());
+        assert_eq!(mock.recorded_requests().len(), 2);
+
+        let c1 = EpisodeStore::clear(&store, &sc, &EditKey::new("ec-1"))
+            .await
+            .unwrap();
+        let c1_retry = EpisodeStore::clear(&store, &sc, &EditKey::new("ec-1"))
+            .await
+            .unwrap();
+        assert_eq!(c1, c1_retry);
+        assert_eq!(mock.recorded_requests().len(), 3);
+
+        // Simulate transport network error mapping.
+        mock.enqueue(Err(AdapterError::Transport {
+            message: String::from("connection refused"),
+        }));
+        let clear_err = MemoryStore::clear(&store, &sc).await.unwrap_err();
+        assert_eq!(clear_err.kind(), ErrorKind::Unavailable);
+    }
+}
+
+mod xerj_adapter {
+    use std::collections::BTreeSet;
+
+    use autumn_harvest_agent::episode::{EpisodeStore, PassMark};
+    use autumn_harvest_agent::memory::{EditKey, MemoryScope, MemoryStore};
+    use serde_json::json;
+
+    use super::{add, episode};
+    use crate::{
+        CYGNUS_XERJ_DEFAULT_URL, HttpMethod, MockHttpTransport, StoreHttpResponse,
+        WatermarkDriftReason, WatermarkSyncDecision, XerjClientConfig, XerjEmbedMode,
+        XerjFusionStrategy, XerjHybridQueryBuilder, XerjHybridSearchStore, XerjMemoryRecallQuery,
+        compute_corpus_content_hash,
+    };
+
+    #[tokio::test]
+    async fn cygnus_config_and_hybrid_query_builder_enforce_safety_invariants() {
+        // Loopback `:9200` is rejected on shared hosts unless explicitly opted in.
+        assert!(XerjClientConfig::new("http://127.0.0.1:9200", "littleguy").is_err());
+        assert!(XerjClientConfig::new("http://localhost:9200", "littleguy").is_err());
+        assert!(
+            XerjClientConfig::new_allowing_loopback("http://127.0.0.1:9200", "littleguy").is_ok()
+        );
+
+        let cfg = XerjClientConfig::cygnus_default("littleguy-mem").unwrap();
+        assert_eq!(
+            cfg.base_url().as_str(),
+            "http://xerj.tail769bd2.ts.net:9200/"
+        );
+        assert_eq!(cfg.embed_mode(), XerjEmbedMode::Proxy);
+        assert_eq!(
+            CYGNUS_XERJ_DEFAULT_URL,
+            "http://xerj.tail769bd2.ts.net:9200"
+        );
+
+        // Reject path traversal / query injection in index names and `max_tokens < 32`.
+        assert!(
+            XerjHybridQueryBuilder::new("../_all", "Mandate")
+                .build()
+                .is_err()
+        );
+        assert!(
+            XerjHybridQueryBuilder::new("soma-*?pretty=true", "Mandate")
+                .build()
+                .is_err()
+        );
+        assert!(
+            XerjHybridQueryBuilder::new("soma-*", "Mandate")
+                .max_tokens(16)
+                .build()
+                .is_err()
+        );
+
+        let query = XerjHybridQueryBuilder::new("soma-*", "SeatSubstrate lease_epoch")
+            .fusion(XerjFusionStrategy::Rrf)
+            .weights(1.0, 1.5)
+            .limits(15, 5)
+            .max_tokens(512)
+            .term_filter("kind", "rust_fn")
+            .local_judge("How does SeatSubstrate fence lease_epoch?", Some(0.35))
+            .build()
+            .unwrap();
+
+        let mock = MockHttpTransport::new();
+        mock.enqueue_json(
+            200,
+            &json!({
+                "hits": {
+                    "hits": [{
+                        "_index": "soma-runtime-code",
+                        "_id": "doc-1",
+                        "_score": 0.91,
+                        "_p_relevant": 0.88,
+                        "_source": {"ax_path": "crates/escapement/src/seat.rs", "symbol": "SeatSubstrate"},
+                        "fields": {"_passage": ["pub trait SeatSubstrate"]}
+                    }]
+                }
+            }),
+        )
+        .unwrap();
+
+        let store = XerjHybridSearchStore::open_in_memory(cfg, mock.clone()).unwrap();
+        let resp = store.hybrid_search(&query).await.unwrap();
+        assert_eq!(resp.hits().len(), 1);
+        assert_eq!(
+            resp.hits()[0].source["ax_path"],
+            "crates/escapement/src/seat.rs"
+        );
+
+        let req = &mock.recorded_requests()[0];
+        assert_eq!(req.method, HttpMethod::Post);
+        assert_eq!(
+            req.url.as_str(),
+            "http://xerj.tail769bd2.ts.net:9200/soma-*/_search"
+        );
+        assert!(
+            req.headers
+                .contains(&(String::from("X-Xerj-Embed-Mode"), String::from("proxy")))
+        );
+
+        let wire = req.parse_json_body().unwrap();
+        assert_eq!(wire["query"]["hybrid"]["fusion"], "rrf");
+        assert_eq!(wire["fields"], json!(["_passage"]));
+        assert_eq!(wire["max_tokens"], 512);
+        assert_eq!(wire["size"], 5);
+        assert_eq!(
+            wire["query"]["hybrid"]["queries"][1]["query"]["semantic"]["k"],
+            15
+        );
+    }
+
+    #[tokio::test]
+    async fn content_hash_and_commit_sha_watermarks_detect_every_drift_mode() {
+        let docs_a = [
+            ("src/lib.rs", b"pub fn alpha() -> u32 { 1 }".as_slice()),
+            ("specs/0003.md", b"# Spec 0003".as_slice()),
+        ];
+        let docs_reordered = [
+            ("specs/0003.md", b"# Spec 0003".as_slice()),
+            ("src/lib.rs", b"pub fn alpha() -> u32 { 1 }".as_slice()),
+        ];
+        let docs_modified = [
+            ("src/lib.rs", b"pub fn alpha() -> u32 { 2 }".as_slice()),
+            ("specs/0003.md", b"# Spec 0003".as_slice()),
+        ];
+
+        let hash_a = compute_corpus_content_hash(&docs_a);
+        let hash_reordered = compute_corpus_content_hash(&docs_reordered);
+        let hash_modified = compute_corpus_content_hash(&docs_modified);
+        assert_eq!(hash_a.len(), 64);
+        assert_eq!(
+            hash_a, hash_reordered,
+            "corpus hash must be order-independent"
+        );
+        assert_ne!(hash_a, hash_modified, "1-byte edit must change corpus hash");
+
+        let sha_1 = "09ad254000000000000000000000000000000001";
+        let sha_2 = "cae597e000000000000000000000000000000002";
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("xerj-wm.db");
+        let cfg = XerjClientConfig::cygnus_default("littleguy-mem").unwrap();
+        let mock = MockHttpTransport::new();
+        let store = XerjHybridSearchStore::open(&db_path, cfg.clone(), mock.clone()).unwrap();
+
+        // 1. Remote 404 -> NeedsSync(MissingRemoteMeta).
+        mock.enqueue(Ok(StoreHttpResponse::new(404, b"{}".to_vec())));
+        let d1 = store
+            .evaluate_watermark("lg-code-rust", sha_1, &hash_a)
+            .await
+            .unwrap();
+        assert!(matches!(
+            d1,
+            WatermarkSyncDecision::NeedsSync {
+                reason: WatermarkDriftReason::MissingRemoteMeta,
+                ..
+            }
+        ));
+
+        // 2. Advance watermark -> PUT /lg-code-rust/_mapping + local SQLite row.
+        mock.enqueue_json(200, &json!({"acknowledged": true}))
+            .unwrap();
+        let wm = store
+            .advance_watermark("lg-code-rust", sha_1, &hash_a, 1_760_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(wm.commit_sha, sha_1);
+        assert_eq!(wm.content_hash, hash_a);
+
+        let put_req = mock.recorded_requests().last().unwrap().clone();
+        assert_eq!(put_req.method, HttpMethod::Put);
+        assert_eq!(put_req.url.path(), "/lg-code-rust/_mapping");
+        let put_body = put_req.parse_json_body().unwrap();
+        assert_eq!(put_body["_meta"]["commit_sha"], sha_1);
+        assert_eq!(put_body["_meta"]["content_hash"], hash_a);
+
+        // 3. Reopen SQLite file and verify UpToDate when remote _meta agrees.
+        drop(store);
+        let store = XerjHybridSearchStore::open(&db_path, cfg, mock.clone()).unwrap();
+        let matching_remote = json!({
+            "lg-code-rust": {
+                "mappings": {
+                    "_meta": {
+                        "commit_sha": sha_1,
+                        "content_hash": hash_a,
+                        "updated_at_ms": 1_760_000_000_000_u64
+                    }
+                }
+            }
+        });
+        mock.enqueue_json(200, &matching_remote).unwrap();
+        let d2 = store
+            .evaluate_watermark("lg-code-rust", sha_1, &hash_a)
+            .await
+            .unwrap();
+        assert_eq!(d2, WatermarkSyncDecision::UpToDate { watermark: wm });
+
+        // 4. Commit SHA changed -> CommitShaChanged.
+        mock.enqueue_json(200, &matching_remote).unwrap();
+        let d3 = store
+            .evaluate_watermark("lg-code-rust", sha_2, &hash_a)
+            .await
+            .unwrap();
+        assert!(matches!(
+            d3,
+            WatermarkSyncDecision::NeedsSync {
+                reason: WatermarkDriftReason::CommitShaChanged,
+                ..
+            }
+        ));
+
+        // 5. Same commit SHA but dirty working-tree content hash -> ContentHashChanged.
+        mock.enqueue_json(200, &matching_remote).unwrap();
+        let d4 = store
+            .evaluate_watermark("lg-code-rust", sha_1, &hash_modified)
+            .await
+            .unwrap();
+        assert!(matches!(
+            d4,
+            WatermarkSyncDecision::NeedsSync {
+                reason: WatermarkDriftReason::ContentHashChanged,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn xerj_memory_and_episode_stores_sync_and_recall_offline() {
+        let cfg = XerjClientConfig::cygnus_default("littleguy-mem").unwrap();
+        let mock = MockHttpTransport::new();
+        let store = XerjHybridSearchStore::open_in_memory(cfg, mock.clone()).unwrap();
+        let sc = MemoryScope::new("agent:assistant/mark");
+
+        let labels = BTreeSet::from([String::from("untrusted_input")]);
+        store
+            .apply_labelled(
+                &sc,
+                add("sensitive-xerj-entry"),
+                &EditKey::new("xk-1"),
+                &labels,
+            )
+            .await
+            .unwrap();
+        // Idempotent retry emits no extra network request.
+        store
+            .apply_labelled(
+                &sc,
+                add("sensitive-xerj-entry"),
+                &EditKey::new("xk-1"),
+                &labels,
+            )
+            .await
+            .unwrap();
+        assert_eq!(mock.recorded_requests().len(), 1);
+        assert_eq!(
+            mock.recorded_requests()[0].url.path(),
+            "/_memory/littleguy-mem"
+        );
+        assert!(!format!("{store:?}").contains("sensitive-xerj-entry"));
+
+        store
+            .append(&sc, &EditKey::new("xe-1"), episode("ep-1"), 10)
+            .await
+            .unwrap();
+        let mark = PassMark {
+            key: EditKey::new("xp-1"),
+            generation: 0,
+            episodes: vec![String::from("ep-1")],
+            dropped: 0,
+            facts: vec![String::from("fact-1")],
+        };
+        assert!(store.mark(&sc, mark).await.unwrap());
+        EpisodeStore::clear(&store, &sc, &EditKey::new("xc-1"))
+            .await
+            .unwrap();
+
+        mock.enqueue_json(
+            200,
+            &json!({
+                "hits": [{
+                    "id": "mem:agent:assistant/mark:memory",
+                    "text": "sensitive-xerj-entry",
+                    "score": 0.95,
+                    "metadata": {"flow_labels": ["untrusted_input"]}
+                }]
+            }),
+        )
+        .unwrap();
+        let recalled = store
+            .recall_memories(&XerjMemoryRecallQuery::hybrid_rrf("xerj", 5))
+            .await
+            .unwrap();
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].text, "sensitive-xerj-entry");
+    }
+}

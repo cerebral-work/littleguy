@@ -9,7 +9,9 @@ repository.workspace = true
 
 [dependencies]
 autumn-harvest-agent = { version = "0.10.0", default-features = false }
+blake3 = "1.8"
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 url = "2"

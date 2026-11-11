@@ -34,11 +34,33 @@ use autumn_harvest_agent::{AgentError, ErrorKind};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 pub mod approvals;
+pub mod reverie;
+pub mod transport;
+pub mod xerj;
 
 pub use approvals::{ApprovalRecord, Claim, Verdict};
+pub use reverie::{
+    DEFAULT_REVERIE_URL, DEFAULT_SMART_CONTEXT_LIMIT, MAX_REVERIE_SEARCH_LIMIT,
+    MAX_SMART_CONTEXT_LIMIT, ReverieClientConfig, ReverieObservationBuilder, ReverieObservationHit,
+    ReverieObservationKind, ReverieObservationPayload, ReverieObservationStore,
+    ReverieSavedReceipt, ReverieScope, ReverieSearchQuery, ReverieSmartContext, ReverieTag,
+    ReverieWriteMode, validate_topic_key,
+};
+pub use transport::{
+    AdapterError, DEFAULT_HTTP_TIMEOUT, HttpMethod, HttpTransport, MockHttpTransport,
+    MockRouteHandler, ReqwestHttpTransport, StoreHttpRequest, StoreHttpResponse,
+};
+pub use xerj::{
+    CYGNUS_XERJ_DEFAULT_URL, CommitWatermark, DEFAULT_PASSAGE_FIELD, MIN_XERJ_MAX_TOKENS,
+    WatermarkDriftReason, WatermarkSyncDecision, XerjClientConfig, XerjEmbedMode,
+    XerjFusionStrategy, XerjHybridQuery, XerjHybridQueryBuilder, XerjHybridSearchStore,
+    XerjLocalJudge, XerjMappingMeta, XerjMemoryRecallHit, XerjMemoryRecallQuery, XerjSearchHit,
+    XerjSearchResponse, compute_corpus_content_hash, validate_commit_sha, validate_content_hash,
+    validate_xerj_identifier,
+};
 
 /// The schema version that [`SqliteStores::open`] writes.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The most edit keys that one memory scope keeps. A retry comes soon after
 /// its first attempt, so the oldest key is safe to forget. The engine keeps
@@ -79,6 +101,12 @@ CREATE TABLE IF NOT EXISTS approvals (
     requester TEXT,
     verdict   TEXT,
     closed    INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS xerj_watermarks (
+    index_name    TEXT PRIMARY KEY,
+    commit_sha    TEXT NOT NULL,
+    content_hash  TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL
 );
 ";
 
@@ -201,7 +229,7 @@ impl SqliteStores {
     }
 
     /// Applies one memory edit once for its key.
-    fn apply_now(
+    pub(crate) fn apply_now(
         &self,
         scope: &MemoryScope,
         op: &MemoryOp,
@@ -248,6 +276,151 @@ impl SqliteStores {
                 }
             }
         })?
+    }
+
+    /// Evaluates whether `key` was already applied or fails locally before
+    /// emitting a remote Reverie/XERJ write-through.
+    pub(crate) fn preview_memory_edit(
+        &self,
+        scope: &MemoryScope,
+        op: &MemoryOp,
+        key: &EditKey,
+        labels: &BTreeSet<String>,
+    ) -> Result<MemoryEditPreview, AgentError> {
+        self.write(|tx| {
+            let mut blocks = self.blocks(tx, scope)?;
+            let stored: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT error FROM memory_edits WHERE scope = ?1 AND key = ?2",
+                    params![scope.as_str(), key.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match stored {
+                Some(Some(message)) => Ok(MemoryEditPreview::Cached(Err(AgentError::new(
+                    ErrorKind::Tool,
+                    message,
+                )))),
+                Some(None) => Ok(MemoryEditPreview::Cached(current(&blocks, op))),
+                None => match autumn_harvest_agent::memory::apply_to(&mut blocks, op, labels) {
+                    Ok(updated_block) => Ok(MemoryEditPreview::ReadyToSync { updated_block }),
+                    Err(err) => {
+                        tx.execute(
+                            "INSERT INTO memory_edits (scope, key, error) VALUES (?1, ?2, ?3)",
+                            params![scope.as_str(), key.as_str(), err.message()],
+                        )?;
+                        tx.execute(
+                            "DELETE FROM memory_edits WHERE scope = ?1 AND seq <= \
+                             (SELECT MAX(seq) FROM memory_edits WHERE scope = ?1) - ?2",
+                            params![scope.as_str(), MAX_EDIT_KEYS],
+                        )?;
+                        Ok(MemoryEditPreview::FailedNew(err))
+                    }
+                },
+            }
+        })
+    }
+
+    /// Checks whether an episode append key was already applied before remote sync.
+    pub(crate) fn preview_episode_append(
+        &self,
+        scope: &MemoryScope,
+        key: &EditKey,
+        episode: &Episode,
+        max_episodes: u32,
+    ) -> Result<EpisodeAppendPreview, AgentError> {
+        self.read(|conn| {
+            let log = load_log(conn, scope)?;
+            let mut candidate = log.clone();
+            let appended = candidate.append(key, episode.clone(), max_episodes);
+            if candidate == log {
+                Ok(EpisodeAppendPreview::Cached(appended))
+            } else {
+                Ok(EpisodeAppendPreview::ReadyToSync)
+            }
+        })
+    }
+
+    /// Checks whether a consolidation pass mark is stale or already applied.
+    pub(crate) fn preview_episode_mark(
+        &self,
+        scope: &MemoryScope,
+        mark: &PassMark,
+    ) -> Result<EpisodeMarkPreview, AgentError> {
+        self.read(|conn| {
+            let log = load_log(conn, scope)?;
+            let mut candidate = log.clone();
+            if !candidate.mark(mark) {
+                Ok(EpisodeMarkPreview::StaleGeneration)
+            } else if candidate == log {
+                Ok(EpisodeMarkPreview::CachedTrue)
+            } else {
+                Ok(EpisodeMarkPreview::ReadyToSync)
+            }
+        })
+    }
+
+    /// Checks whether an episode clear key was already applied before remote sync.
+    pub(crate) fn preview_episode_clear(
+        &self,
+        scope: &MemoryScope,
+        key: &EditKey,
+    ) -> Result<EpisodeClearPreview, AgentError> {
+        self.read(|conn| {
+            let last: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT key, cleared FROM episode_clears WHERE scope = ?1",
+                    params![scope.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((last_key, cleared)) = last
+                && last_key == key.as_str()
+            {
+                return Ok(EpisodeClearPreview::Cached(decode(&cleared)?));
+            }
+            Ok(EpisodeClearPreview::ReadyToSync)
+        })
+    }
+
+    /// Reads `(commit_sha, content_hash, updated_at_ms)` from `xerj_watermarks`.
+    pub(crate) fn read_xerj_watermark(
+        &self,
+        index_name: &str,
+    ) -> Result<Option<(String, String, u64)>, AgentError> {
+        self.read(|conn| {
+            let row: Option<(String, String, i64)> = conn
+                .query_row(
+                    "SELECT commit_sha, content_hash, updated_at_ms FROM xerj_watermarks WHERE index_name = ?1",
+                    params![index_name],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            Ok(row.map(|(sha, hash, ts)| (sha, hash, u64::try_from(ts).unwrap_or(0))))
+        })
+    }
+
+    /// Upserts `(commit_sha, content_hash, updated_at_ms)` into `xerj_watermarks`.
+    pub(crate) fn write_xerj_watermark(
+        &self,
+        index_name: &str,
+        commit_sha: &str,
+        content_hash: &str,
+        updated_at_ms: u64,
+    ) -> Result<(), AgentError> {
+        let ts = i64::try_from(updated_at_ms).unwrap_or(i64::MAX);
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO xerj_watermarks (index_name, commit_sha, content_hash, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (index_name) DO UPDATE SET \
+                 commit_sha = excluded.commit_sha, \
+                 content_hash = excluded.content_hash, \
+                 updated_at_ms = excluded.updated_at_ms",
+                params![index_name, commit_sha, content_hash, ts],
+            )?;
+            Ok(())
+        })
     }
 
     /// The blocks of `scope`, or the template for a new scope.
@@ -451,6 +624,32 @@ impl Failure {
             ),
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum MemoryEditPreview {
+    Cached(Result<MemoryBlock, AgentError>),
+    FailedNew(AgentError),
+    ReadyToSync { updated_block: MemoryBlock },
+}
+
+#[derive(Debug)]
+pub(crate) enum EpisodeAppendPreview {
+    Cached(Appended),
+    ReadyToSync,
+}
+
+#[derive(Debug)]
+pub(crate) enum EpisodeMarkPreview {
+    StaleGeneration,
+    CachedTrue,
+    ReadyToSync,
+}
+
+#[derive(Debug)]
+pub(crate) enum EpisodeClearPreview {
+    Cached(Cleared),
+    ReadyToSync,
 }
 
 #[cfg(test)]
