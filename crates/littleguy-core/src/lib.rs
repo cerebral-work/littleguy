@@ -5,6 +5,7 @@
 
 pub mod addr;
 pub mod config;
+pub mod ghost_binding;
 pub mod ids;
 pub mod mandate_bridge;
 pub mod orchestration;
@@ -17,6 +18,9 @@ pub use config::{
     FirecrackerConfig, FlowConfig, FlowRecheck, GoogleConfig, Integration, McpServer, McpTransport,
     MemoryConfig, SanMateoConfig, SanMateoError, SandboxBackend, SandboxConfig, SlackConfig,
     ToolsConfig, chat_user, discord_sender, slack_sender,
+};
+pub use ghost_binding::{
+    GhostBinding, GhostBindingError, GhostBindingWire, GhostLifecycleState, GhostManifestation,
 };
 pub use ids::{ChannelId, IdError, MessageId, OwnerName, SenderId};
 pub use mandate_bridge::{

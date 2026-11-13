@@ -1,0 +1,546 @@
+//! A zero-I/O `GhostBinding` and its validator (spec 0004).
+//!
+//! The types mirror the cortex GHOST contract (`cortex-domain::ghost`,
+//! REQ-0125-01 to -04). littleguy does not depend on cortex. A test pins the
+//! serialized shape so drift shows up. The module does no I/O.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// The cortex seat URI prefix for a persistent Ghost.
+pub const GHOST_SPIFFE_AGENT_PREFIX: &str = "spiffe://unsigned.gg/agent/";
+/// The longest `ghost_id` in bytes.
+pub const MAX_GHOST_ID_BYTES: usize = 64;
+/// The longest `mitc_principal` in bytes.
+pub const MAX_MITC_PRINCIPAL_BYTES: usize = 128;
+/// The longest `spiffe_seat` in bytes.
+pub const MAX_SPIFFE_SEAT_BYTES: usize = 256;
+/// The longest seat team or slug in bytes.
+pub const MAX_SEAT_SEGMENT_BYTES: usize = 63;
+/// The exact length of a `persona_digest` (lowercase hex SHA-256).
+pub const PERSONA_DIGEST_HEX_LEN: usize = 64;
+/// The longest `handoff_ref` in bytes.
+pub const MAX_HANDOFF_REF_BYTES: usize = 256;
+
+/// The Ghost manifestation taxonomy (cortex `GhostManifestation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GhostManifestation {
+    /// A repository or domain callsign.
+    Persona,
+    /// A partner paired with a human principal.
+    Muse,
+    /// A named persistent mesh seat.
+    Agent,
+    /// An ephemeral subordinate slot. It holds no persistent seat.
+    Crew,
+    /// An autonomous cluster or daemon guardian.
+    Revenant,
+}
+
+impl GhostManifestation {
+    /// The `snake_case` wire form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Persona => "persona",
+            Self::Muse => "muse",
+            Self::Agent => "agent",
+            Self::Crew => "crew",
+            Self::Revenant => "revenant",
+        }
+    }
+
+    /// True when the manifestation can hold a persistent seat.
+    #[must_use]
+    pub const fn supports_persistent_seat(self) -> bool {
+        !matches!(self, Self::Crew)
+    }
+}
+
+impl fmt::Display for GhostManifestation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The nine Ghost lifecycle states (cortex `GhostLifecycleState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GhostLifecycleState {
+    /// Identity minted, not yet paired.
+    Minted,
+    /// Paired to a principal.
+    Paired,
+    /// Attached to a shell.
+    Embodied,
+    /// Running in a shell.
+    Awake,
+    /// Draining before a molt.
+    Quiescing,
+    /// Shell released, seat reserved.
+    Dormant,
+    /// Offline consolidation.
+    Dreaming,
+    /// Isolated after a violation.
+    Quarantined,
+    /// Terminal.
+    Retired,
+}
+
+impl GhostLifecycleState {
+    /// The `snake_case` wire form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Minted => "minted",
+            Self::Paired => "paired",
+            Self::Embodied => "embodied",
+            Self::Awake => "awake",
+            Self::Quiescing => "quiescing",
+            Self::Dormant => "dormant",
+            Self::Dreaming => "dreaming",
+            Self::Quarantined => "quarantined",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+impl fmt::Display for GhostLifecycleState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why a Ghost binding is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum GhostBindingError {
+    /// A required field is empty.
+    #[error("ghost binding field `{field}` is empty")]
+    EmptyField {
+        /// The field name.
+        field: &'static str,
+    },
+    /// A field is longer than its cap.
+    #[error("ghost binding field `{field}` is longer than {max} bytes")]
+    FieldTooLong {
+        /// The field name.
+        field: &'static str,
+        /// The cap in bytes.
+        max: usize,
+    },
+    /// A field holds a character its rule does not allow.
+    #[error("ghost binding field `{field}` holds a character that is not allowed")]
+    InvalidField {
+        /// The field name.
+        field: &'static str,
+    },
+    /// A `Crew` binding holds a persistent seat (REQ-0125-04).
+    #[error("a crew ghost cannot hold a persistent spiffe seat")]
+    CrewHoldsSeat,
+    /// A `Crew` binding names a state that cortex forbids for it (REQ-0125-04).
+    #[error("a crew ghost cannot be in the `{state}` state")]
+    CrewForbiddenState {
+        /// The refused state.
+        state: GhostLifecycleState,
+    },
+    /// A persistent manifestation has no seat (REQ-0125-03).
+    #[error("a `{manifestation}` ghost needs a persistent spiffe seat")]
+    MissingSeat {
+        /// The manifestation.
+        manifestation: GhostManifestation,
+    },
+    /// The seat is not `spiffe://unsigned.gg/agent/TEAM/SLUG` (REQ-0125-03).
+    #[error("invalid ghost spiffe seat: {reason}")]
+    InvalidSpiffeSeat {
+        /// The short reason.
+        reason: &'static str,
+    },
+}
+
+/// The unvalidated wire form of a [`GhostBinding`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GhostBindingWire {
+    /// The Ghost callsign.
+    pub ghost_id: String,
+    /// The manifestation.
+    pub manifestation: GhostManifestation,
+    /// The human principal that owns the Ghost.
+    pub mitc_principal: String,
+    /// The persistent seat, or `None` for `Crew`.
+    #[serde(default)]
+    pub spiffe_seat: Option<String>,
+    /// The molt counter.
+    pub molt_epoch: u64,
+    /// The lifecycle state, when the delivery states it.
+    #[serde(default)]
+    pub lifecycle_state: Option<GhostLifecycleState>,
+    /// A SHA-256 of the persona charter, as 64 lowercase hex characters.
+    #[serde(default)]
+    pub persona_digest: Option<String>,
+    /// A handoff reference.
+    #[serde(default)]
+    pub handoff_ref: Option<String>,
+}
+
+/// A validated Ghost binding. Build it with [`validate`] or deserialize it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "GhostBindingWire", into = "GhostBindingWire")]
+pub struct GhostBinding {
+    wire: GhostBindingWire,
+}
+
+impl GhostBinding {
+    /// The Ghost callsign.
+    #[must_use]
+    pub fn ghost_id(&self) -> &str {
+        &self.wire.ghost_id
+    }
+
+    /// The manifestation.
+    #[must_use]
+    pub const fn manifestation(&self) -> GhostManifestation {
+        self.wire.manifestation
+    }
+
+    /// The human principal that owns the Ghost.
+    #[must_use]
+    pub fn mitc_principal(&self) -> &str {
+        &self.wire.mitc_principal
+    }
+
+    /// The persistent seat, if any.
+    #[must_use]
+    pub fn spiffe_seat(&self) -> Option<&str> {
+        self.wire.spiffe_seat.as_deref()
+    }
+
+    /// The molt counter.
+    #[must_use]
+    pub const fn molt_epoch(&self) -> u64 {
+        self.wire.molt_epoch
+    }
+
+    /// The stated lifecycle state, if any.
+    #[must_use]
+    pub const fn lifecycle_state(&self) -> Option<GhostLifecycleState> {
+        self.wire.lifecycle_state
+    }
+
+    /// The persona digest, if any.
+    #[must_use]
+    pub fn persona_digest(&self) -> Option<&str> {
+        self.wire.persona_digest.as_deref()
+    }
+
+    /// The handoff reference, if any.
+    #[must_use]
+    pub fn handoff_ref(&self) -> Option<&str> {
+        self.wire.handoff_ref.as_deref()
+    }
+}
+
+impl From<GhostBinding> for GhostBindingWire {
+    fn from(binding: GhostBinding) -> Self {
+        binding.wire
+    }
+}
+
+impl TryFrom<GhostBindingWire> for GhostBinding {
+    type Error = GhostBindingError;
+
+    fn try_from(wire: GhostBindingWire) -> Result<Self, Self::Error> {
+        validate(wire)
+    }
+}
+
+/// Validates a wire binding against the cortex GHOST contract.
+///
+/// # Errors
+///
+/// Returns [`GhostBindingError`] when a field breaks its bound or a cortex rule.
+pub fn validate(wire: GhostBindingWire) -> Result<GhostBinding, GhostBindingError> {
+    Ok(GhostBinding { wire })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire(manifestation: GhostManifestation) -> GhostBindingWire {
+        let seat = manifestation
+            .supports_persistent_seat()
+            .then(|| "spiffe://unsigned.gg/agent/platform/sadr".to_owned());
+        GhostBindingWire {
+            ghost_id: "sadr".to_owned(),
+            manifestation,
+            mitc_principal: "ctodie".to_owned(),
+            spiffe_seat: seat,
+            molt_epoch: 3,
+            lifecycle_state: None,
+            persona_digest: None,
+            handoff_ref: None,
+        }
+    }
+
+    fn err(w: GhostBindingWire) -> GhostBindingError {
+        validate(w).expect_err("binding must be refused")
+    }
+
+    #[test]
+    fn serialized_shape_matches_cortex_contract() {
+        let json = serde_json::to_value(validate(wire(GhostManifestation::Agent)).unwrap()).unwrap();
+        let expected = serde_json::json!({
+            "ghost_id": "sadr",
+            "manifestation": "agent",
+            "mitc_principal": "ctodie",
+            "spiffe_seat": "spiffe://unsigned.gg/agent/platform/sadr",
+            "molt_epoch": 3,
+            "lifecycle_state": null,
+            "persona_digest": null,
+            "handoff_ref": null,
+        });
+        assert_eq!(json, expected);
+        for (m, s) in [
+            (GhostManifestation::Persona, "persona"),
+            (GhostManifestation::Muse, "muse"),
+            (GhostManifestation::Agent, "agent"),
+            (GhostManifestation::Crew, "crew"),
+            (GhostManifestation::Revenant, "revenant"),
+        ] {
+            assert_eq!(serde_json::to_value(m).unwrap(), serde_json::json!(s));
+            assert_eq!(m.as_str(), s);
+        }
+        let states = [
+            (GhostLifecycleState::Minted, "minted"),
+            (GhostLifecycleState::Paired, "paired"),
+            (GhostLifecycleState::Embodied, "embodied"),
+            (GhostLifecycleState::Awake, "awake"),
+            (GhostLifecycleState::Quiescing, "quiescing"),
+            (GhostLifecycleState::Dormant, "dormant"),
+            (GhostLifecycleState::Dreaming, "dreaming"),
+            (GhostLifecycleState::Quarantined, "quarantined"),
+            (GhostLifecycleState::Retired, "retired"),
+        ];
+        for (s, text) in states {
+            assert_eq!(serde_json::to_value(s).unwrap(), serde_json::json!(text));
+            assert_eq!(s.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn crew_with_seat_is_refused() {
+        let mut w = wire(GhostManifestation::Crew);
+        w.spiffe_seat = Some("spiffe://unsigned.gg/agent/platform/crew-1".to_owned());
+        assert_eq!(err(w), GhostBindingError::CrewHoldsSeat);
+    }
+
+    #[test]
+    fn crew_in_dormant_is_refused() {
+        let mut w = wire(GhostManifestation::Crew);
+        w.lifecycle_state = Some(GhostLifecycleState::Dormant);
+        assert_eq!(
+            err(w),
+            GhostBindingError::CrewForbiddenState { state: GhostLifecycleState::Dormant }
+        );
+    }
+
+    #[test]
+    fn crew_in_dreaming_is_refused() {
+        let mut w = wire(GhostManifestation::Crew);
+        w.lifecycle_state = Some(GhostLifecycleState::Dreaming);
+        assert_eq!(
+            err(w),
+            GhostBindingError::CrewForbiddenState { state: GhostLifecycleState::Dreaming }
+        );
+    }
+
+    #[test]
+    fn crew_without_seat_is_accepted() {
+        let mut w = wire(GhostManifestation::Crew);
+        w.lifecycle_state = Some(GhostLifecycleState::Awake);
+        let b = validate(w).unwrap();
+        assert_eq!(b.spiffe_seat(), None);
+        assert_eq!(b.molt_epoch(), 3);
+    }
+
+    #[test]
+    fn persistent_without_seat_is_refused() {
+        for m in [
+            GhostManifestation::Persona,
+            GhostManifestation::Muse,
+            GhostManifestation::Agent,
+            GhostManifestation::Revenant,
+        ] {
+            let mut w = wire(m);
+            w.spiffe_seat = None;
+            assert_eq!(err(w), GhostBindingError::MissingSeat { manifestation: m });
+        }
+    }
+
+    #[test]
+    fn persistent_with_valid_seat_is_accepted() {
+        for m in [
+            GhostManifestation::Persona,
+            GhostManifestation::Muse,
+            GhostManifestation::Agent,
+            GhostManifestation::Revenant,
+        ] {
+            let b = validate(wire(m)).unwrap();
+            assert_eq!(b.ghost_id(), "sadr");
+            assert_eq!(b.manifestation(), m);
+            assert_eq!(b.mitc_principal(), "ctodie");
+            assert_eq!(b.spiffe_seat(), Some("spiffe://unsigned.gg/agent/platform/sadr"));
+        }
+    }
+
+    #[test]
+    fn malformed_seats_are_refused() {
+        let bad = [
+            "",
+            "agent/platform/sadr",
+            "spiffe://unsigned.gg/agent/platform",
+            "spiffe://unsigned.gg/agent//sadr",
+            "spiffe://unsigned.gg/agent/platform/",
+            "spiffe://unsigned.gg/agent/platform/sadr/extra",
+            "spiffe://unsigned.gg/agent/Platform/sadr",
+            "spiffe://unsigned.gg/agent/platform/sa_dr",
+            "spiffe://unsigned.gg/agent/platform/sa.dr",
+            "spiffe://unsigned.gg/agent/platform/..",
+            "spiffe://unsigned.gg/conclave/ceres/elf/w1",
+            "spiffe://unsigned.gg/human/ctodie",
+            "spiffe://cerebral.internal/agent/platform/sadr",
+            "spiffe://unsigned.gg.evil/agent/platform/sadr",
+            "spiffe://unsigned.gg/agent/platform/sadr ",
+            "spiffe://unsigned.gg/agent/platform/sadr?x=1",
+        ];
+        for seat in bad {
+            let mut w = wire(GhostManifestation::Agent);
+            w.spiffe_seat = Some(seat.to_owned());
+            assert!(
+                matches!(
+                    validate(w),
+                    Err(GhostBindingError::InvalidSpiffeSeat { .. }
+                        | GhostBindingError::EmptyField { .. })
+                ),
+                "seat `{seat}` must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_fields_are_refused() {
+        let mut w = wire(GhostManifestation::Agent);
+        w.ghost_id = String::new();
+        assert_eq!(err(w), GhostBindingError::EmptyField { field: "ghost_id" });
+        let mut w = wire(GhostManifestation::Agent);
+        w.mitc_principal = "   ".to_owned();
+        assert!(matches!(err(w), GhostBindingError::EmptyField { field: "mitc_principal" }
+            | GhostBindingError::InvalidField { field: "mitc_principal" }));
+        let mut w = wire(GhostManifestation::Agent);
+        w.handoff_ref = Some(String::new());
+        assert_eq!(err(w), GhostBindingError::EmptyField { field: "handoff_ref" });
+    }
+
+    #[test]
+    fn oversized_fields_are_refused() {
+        let mut w = wire(GhostManifestation::Agent);
+        w.ghost_id = "a".repeat(MAX_GHOST_ID_BYTES + 1);
+        assert_eq!(
+            err(w),
+            GhostBindingError::FieldTooLong { field: "ghost_id", max: MAX_GHOST_ID_BYTES }
+        );
+        let mut w = wire(GhostManifestation::Agent);
+        w.mitc_principal = "p".repeat(MAX_MITC_PRINCIPAL_BYTES + 1);
+        assert_eq!(
+            err(w),
+            GhostBindingError::FieldTooLong {
+                field: "mitc_principal",
+                max: MAX_MITC_PRINCIPAL_BYTES
+            }
+        );
+        let mut w = wire(GhostManifestation::Agent);
+        w.spiffe_seat = Some(format!(
+            "{GHOST_SPIFFE_AGENT_PREFIX}team/{}",
+            "s".repeat(MAX_SPIFFE_SEAT_BYTES)
+        ));
+        assert_eq!(
+            err(w),
+            GhostBindingError::FieldTooLong {
+                field: "spiffe_seat",
+                max: MAX_SPIFFE_SEAT_BYTES
+            }
+        );
+        let mut w = wire(GhostManifestation::Agent);
+        w.handoff_ref = Some("h".repeat(MAX_HANDOFF_REF_BYTES + 1));
+        assert_eq!(
+            err(w),
+            GhostBindingError::FieldTooLong {
+                field: "handoff_ref",
+                max: MAX_HANDOFF_REF_BYTES
+            }
+        );
+        let mut w = wire(GhostManifestation::Agent);
+        w.spiffe_seat = Some(format!(
+            "{GHOST_SPIFFE_AGENT_PREFIX}team/{}",
+            "s".repeat(MAX_SEAT_SEGMENT_BYTES + 1)
+        ));
+        assert!(matches!(err(w), GhostBindingError::InvalidSpiffeSeat { .. }));
+    }
+
+    #[test]
+    fn bad_field_characters_are_refused() {
+        for id in ["Sadr", "sa_dr", "sa dr", "sadr\n", "sadr\u{e9}"] {
+            let mut w = wire(GhostManifestation::Agent);
+            w.ghost_id = id.to_owned();
+            assert_eq!(err(w), GhostBindingError::InvalidField { field: "ghost_id" });
+        }
+        for p in [" ctodie", "ctodie ", "cto\u{0}die"] {
+            let mut w = wire(GhostManifestation::Agent);
+            w.mitc_principal = p.to_owned();
+            assert_eq!(err(w), GhostBindingError::InvalidField { field: "mitc_principal" });
+        }
+        for d in ["abc", &"A".repeat(PERSONA_DIGEST_HEX_LEN), &"g".repeat(PERSONA_DIGEST_HEX_LEN)] {
+            let mut w = wire(GhostManifestation::Agent);
+            w.persona_digest = Some((*d).to_owned());
+            assert_eq!(err(w), GhostBindingError::InvalidField { field: "persona_digest" });
+        }
+        let mut w = wire(GhostManifestation::Agent);
+        w.handoff_ref = Some("a b".to_owned());
+        assert_eq!(err(w), GhostBindingError::InvalidField { field: "handoff_ref" });
+    }
+
+    #[test]
+    fn optional_fields_are_accepted_when_valid() {
+        let mut w = wire(GhostManifestation::Muse);
+        w.persona_digest = Some("0123456789abcdef".repeat(4));
+        w.handoff_ref = Some("handoffs/2026-11-13/brief-4".to_owned());
+        w.lifecycle_state = Some(GhostLifecycleState::Dormant);
+        let b = validate(w).unwrap();
+        assert_eq!(b.persona_digest().map(str::len), Some(PERSONA_DIGEST_HEX_LEN));
+        assert_eq!(b.handoff_ref(), Some("handoffs/2026-11-13/brief-4"));
+        assert_eq!(b.lifecycle_state(), Some(GhostLifecycleState::Dormant));
+    }
+
+    #[test]
+    fn deserialize_runs_the_validator() {
+        let ok = r#"{"ghost_id":"x1","manifestation":"crew","mitc_principal":"ctodie","molt_epoch":0}"#;
+        let b: GhostBinding = serde_json::from_str(ok).unwrap();
+        assert_eq!(b.ghost_id(), "x1");
+        let bad = r#"{"ghost_id":"x1","manifestation":"crew","mitc_principal":"ctodie","molt_epoch":0,"spiffe_seat":"spiffe://unsigned.gg/agent/t/x1"}"#;
+        assert!(serde_json::from_str::<GhostBinding>(bad).is_err());
+        let unknown = r#"{"ghost_id":"x1","manifestation":"wizard","mitc_principal":"ctodie","molt_epoch":0}"#;
+        assert!(serde_json::from_str::<GhostBinding>(unknown).is_err());
+        let round: GhostBindingWire = b.clone().into();
+        assert_eq!(GhostBinding::try_from(round).unwrap(), b);
+    }
+
+    #[test]
+    fn deserialize_refuses_unknown_fields() {
+        let json = r#"{"ghost_id":"x1","manifestation":"crew","mitc_principal":"ctodie","molt_epoch":0,"extra":1}"#;
+        assert!(serde_json::from_str::<GhostBinding>(json).is_err());
+    }
+}
