@@ -48,7 +48,8 @@ pub use reverie::{
 };
 pub use transport::{
     AdapterError, DEFAULT_HTTP_TIMEOUT, HttpMethod, HttpTransport, MockHttpTransport,
-    MockRouteHandler, ReqwestHttpTransport, StoreHttpRequest, StoreHttpResponse,
+    MockRouteHandler, ReqwestHttpTransport, StoreHttpRequest, StoreHttpResponse, join_url_segments,
+    parse_clean_base_url,
 };
 pub use xerj::{
     CYGNUS_XERJ_DEFAULT_URL, CommitWatermark, DEFAULT_PASSAGE_FIELD, MIN_XERJ_MAX_TOKENS,
@@ -650,6 +651,20 @@ pub(crate) enum EpisodeMarkPreview {
 pub(crate) enum EpisodeClearPreview {
     Cached(Cleared),
     ReadyToSync,
+}
+
+/// Computes the 64-character lowercase hex SHA-256 digest of `bytes`.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 #[cfg(test)]

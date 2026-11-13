@@ -22,7 +22,10 @@ pub use config::{
 pub use ghost_binding::{
     GhostBinding, GhostBindingError, GhostBindingWire, GhostLifecycleState, GhostManifestation,
 };
-pub use ids::{ChannelId, IdError, MessageId, OwnerName, SenderId};
+pub use ids::{
+    ChannelId, DeliveryToken, IdError, MAX_DELIVERY_TOKEN_BYTES, MessageId, OwnerName, PoolPeerId,
+    RoleName, SenderId, ShellId, TaskId,
+};
 pub use mandate_bridge::{
     BiscuitMandateClaims, ConstitutionalSealedAction, ESTATE_TRUST_DOMAIN, MandateBridgeError,
     REJECTED_SPLIT_HORIZON_DOMAINS, ReversibilityClass, SandboxClass, SpiffeAgentIdentity,

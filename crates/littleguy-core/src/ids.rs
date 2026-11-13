@@ -4,12 +4,16 @@
 //! checks it again.
 
 use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// The longest id in bytes. It bounds what a client can make the daemon hold.
 pub const MAX_ID_BYTES: usize = 128;
+
+/// The longest pool delivery token in bytes. `JetStream` ack tokens exceed 128 bytes.
+pub const MAX_DELIVERY_TOKEN_BYTES: usize = 512;
 
 /// Why a text is not a valid id.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -26,6 +30,12 @@ pub enum IdError {
         /// The id type.
         kind: &'static str,
     },
+    /// The delivery token is longer than [`MAX_DELIVERY_TOKEN_BYTES`].
+    #[error("the {kind} is longer than {MAX_DELIVERY_TOKEN_BYTES} bytes")]
+    TokenTooLong {
+        /// The id type.
+        kind: &'static str,
+    },
     /// The text holds a byte that is not printable ASCII.
     #[error("the {kind} holds a byte that is not printable ASCII")]
     NotPrintable {
@@ -35,12 +45,17 @@ pub enum IdError {
 }
 
 /// Checks the shape that every id shares: printable ASCII, not empty, bounded.
-fn check(kind: &'static str, text: &str) -> Result<(), IdError> {
+fn check_with(
+    kind: &'static str,
+    max: usize,
+    too_long: fn(&'static str) -> IdError,
+    text: &str,
+) -> Result<(), IdError> {
     if text.is_empty() {
         return Err(IdError::Empty { kind });
     }
-    if text.len() > MAX_ID_BYTES {
-        return Err(IdError::TooLong { kind });
+    if text.len() > max {
+        return Err(too_long(kind));
     }
     if !text.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(IdError::NotPrintable { kind });
@@ -50,6 +65,9 @@ fn check(kind: &'static str, text: &str) -> Result<(), IdError> {
 
 macro_rules! id_type {
     ($(#[$doc:meta])* $name:ident, $kind:literal) => {
+        id_type!($(#[$doc])* $name, $kind, MAX_ID_BYTES, TooLong);
+    };
+    ($(#[$doc:meta])* $name:ident, $kind:literal, $max:ident, $err:ident) => {
         $(#[$doc])*
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(try_from = "String", into = "String")]
@@ -60,11 +78,11 @@ macro_rules! id_type {
             ///
             /// # Errors
             ///
-            /// Returns an error when `text` is empty, longer than
-            /// [`MAX_ID_BYTES`], or not printable ASCII.
+            /// Returns an error when `text` is empty, over its byte cap, or not
+            /// printable ASCII.
             pub fn new(text: impl Into<String>) -> Result<Self, IdError> {
                 let text = text.into();
-                check($kind, &text)?;
+                check_with($kind, $max, |kind| IdError::$err { kind }, &text)?;
                 Ok(Self(text))
             }
 
@@ -94,6 +112,14 @@ macro_rules! id_type {
                 f.write_str(&self.0)
             }
         }
+
+        impl FromStr for $name {
+            type Err = IdError;
+
+            fn from_str(text: &str) -> Result<Self, Self::Err> {
+                Self::new(text)
+            }
+        }
     };
 }
 
@@ -116,6 +142,33 @@ id_type!(
     /// The owner of the daemon. It names the agent `assistant/<owner>`.
     OwnerName,
     "owner name"
+);
+id_type!(
+    /// The id of one pool task from `escapement-serve`.
+    TaskId,
+    "task id"
+);
+id_type!(
+    /// The shell id of one `lg pool` worker instance.
+    ShellId,
+    "shell id"
+);
+id_type!(
+    /// A Cortex mesh role name, such as `service-escapement-pool`.
+    RoleName,
+    "role name"
+);
+id_type!(
+    /// The peer id of a Cortex pool member.
+    PoolPeerId,
+    "pool peer id"
+);
+id_type!(
+    /// An opaque lease token returned by Cortex `/v1/mesh/pool/recv`.
+    DeliveryToken,
+    "delivery token",
+    MAX_DELIVERY_TOKEN_BYTES,
+    TokenTooLong
 );
 
 #[cfg(test)]

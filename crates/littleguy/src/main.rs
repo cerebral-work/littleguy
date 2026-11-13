@@ -40,8 +40,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use autumn_harvest_agent::AgentModel;
 use clap::{Parser, Subcommand, ValueEnum};
+use littleguy::pool::{self, PoolClient, PoolConfig, PoolToken, PoolWorker, RuntimeTurnRunner};
 use littleguy_channels::{DiscordRest, SlackApi, discord, slack};
-use littleguy_core::{Config, OwnerName};
+use littleguy_core::{Config, OwnerName, PoolPeerId, RoleName, ShellId};
 use littleguy_models::{ClaudeModel, OfflineModel, OpenAiModel, Provider};
 
 use crate::paths::Env;
@@ -105,6 +106,8 @@ enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Pull littleman tasks from a Cortex pool and run one turn per task.
+    Pool(PoolArgs),
 }
 
 /// The models that `lg serve` can run.
@@ -183,6 +186,33 @@ struct ChatArgs {
     /// The message id. A retry with the same id delivers the message once.
     #[arg(long)]
     message_id: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct PoolArgs {
+    /// Base URL of the Cortex API server.
+    #[arg(long, env = "LG_POOL_CORTEX_URL")]
+    cortex_url: String,
+    /// Regular `0600` file owned by the current user holding the bearer token.
+    #[arg(long, env = "LG_POOL_TOKEN_FILE")]
+    token_file: PathBuf,
+    /// Allowed sender role on Cortex deliveries.
+    #[arg(long, default_value = pool::DEFAULT_ALLOWED_SENDER)]
+    allowed_sender: RoleName,
+    /// Long-poll wait in milliseconds on `/v1/mesh/pool/recv`.
+    #[arg(long, default_value_t = pool::DEFAULT_WAIT_MS)]
+    wait_ms: u32,
+    /// Shell identifier reported on pool turn outputs.
+    #[arg(long, env = "LG_POOL_SHELL_ID")]
+    shell_id: ShellId,
+    /// Registered Cortex peer UUID for this pool worker.
+    #[arg(long, env = "LG_POOL_PEER_ID", default_value = pool::DEFAULT_PEER_ID)]
+    peer_id: PoolPeerId,
+    /// Registered Cortex role for this pool worker.
+    #[arg(long, env = "LG_POOL_ROLE", default_value = pool::DEFAULT_MEMBER_ROLE)]
+    role: RoleName,
+    #[command(flatten)]
+    serve: ServeArgs,
 }
 
 /// Reads the config. Without `--config` and with no default file, the owner
@@ -366,6 +396,36 @@ async fn serve(socket: PathBuf, args: ServeArgs, env: &Env) -> Result<()> {
     Ok(())
 }
 
+async fn run_pool(args: PoolArgs, env: &Env) -> Result<()> {
+    let token = PoolToken::load(&args.token_file)?;
+    let config = load_config(args.serve.config.as_deref(), env)?;
+    let db = match args.serve.db.clone() {
+        Some(db) => db,
+        None => env.db()?,
+    };
+    let model = build_model(&args.serve, &db, |var| std::env::var(var).ok())?;
+    let pool_cfg = PoolConfig {
+        cortex_url: args.cortex_url,
+        token,
+        peer_id: args.peer_id,
+        role: args.role,
+        allowed_sender: args.allowed_sender,
+        wait_ms: args.wait_ms,
+        nack_delay_ms: pool::DEFAULT_NACK_DELAY_MS,
+        shell_id: args.shell_id.clone(),
+    };
+    let client = PoolClient::new(&pool_cfg)?;
+    let runner = RuntimeTurnRunner::open(&db, &config, model, args.shell_id)?;
+    let mut worker = PoolWorker::new(pool_cfg, client, runner);
+    let stop = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    worker.run_until(stop).await?;
+    Ok(())
+}
+
 /// Sends one request and prints the answer.
 async fn ask(socket: &Path, request: &Request) -> Result<bool> {
     let response = client::send(socket, request).await?;
@@ -376,12 +436,17 @@ async fn ask(socket: &Path, request: &Request) -> Result<bool> {
 
 async fn run(cli: Cli) -> Result<bool> {
     let env = Env::from_process();
+    if let Command::Pool(args) = cli.command {
+        Box::pin(run_pool(args, &env)).await?;
+        return Ok(true);
+    }
     let socket = match cli.socket {
         Some(socket) => socket,
         None => env.socket()?,
     };
     match cli.command {
         Command::Serve(args) => Box::pin(serve(socket, args, &env)).await.map(|()| true),
+        Command::Pool(_) => unreachable!("handled above"),
         Command::Chat(args) => {
             let request = Request::Chat {
                 message_id: args.message_id.unwrap_or_else(client::fresh_message_id),
@@ -622,5 +687,32 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn the_cli_parses_pool_with_default_allowed_sender() {
+        let cli = Cli::try_parse_from([
+            "lg",
+            "pool",
+            "--cortex-url",
+            "http://127.0.0.1:9999",
+            "--token-file",
+            "/tmp/token",
+            "--wait-ms",
+            "1500",
+            "--shell-id",
+            "shell-01",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Pool(args) => {
+                assert_eq!(args.cortex_url, "http://127.0.0.1:9999");
+                assert_eq!(args.token_file, PathBuf::from("/tmp/token"));
+                assert_eq!(args.allowed_sender.as_str(), "service-escapement-pool");
+                assert_eq!(args.wait_ms, 1500);
+                assert_eq!(args.shell_id.as_str(), "shell-01");
+            }
+            _ => panic!("expected pool command"),
+        }
     }
 }

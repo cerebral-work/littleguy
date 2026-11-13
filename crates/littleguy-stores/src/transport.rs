@@ -488,7 +488,12 @@ impl HttpTransport for MockHttpTransport {
 
 /// Validates and parses an HTTP(S) base URL with no embedded user credentials,
 /// query string, or fragment (`REQ-LG-STORE-02`).
-pub(crate) fn parse_clean_base_url(raw: &str, field: &'static str) -> Result<Url, AdapterError> {
+///
+/// # Errors
+///
+/// Returns [`AdapterError::InvalidConfig`] when `raw` is not a clean `http` or
+/// `https` hierarchical base URL.
+pub fn parse_clean_base_url(raw: &str, field: &'static str) -> Result<Url, AdapterError> {
     let trimmed = raw.trim();
     let parsed = Url::parse(trimmed).map_err(|err| AdapterError::InvalidConfig {
         field,
@@ -526,7 +531,11 @@ pub(crate) fn parse_clean_base_url(raw: &str, field: &'static str) -> Result<Url
 
 /// Appends path segments cleanly onto `base` using [`Url::path_segments_mut`],
 /// avoiding any manual `/` concatenation or string interpolation.
-pub(crate) fn join_url_segments(base: &Url, segments: &[&str]) -> Result<Url, AdapterError> {
+///
+/// # Errors
+///
+/// Returns [`AdapterError::InvalidConfig`] when `base` does not support path segments.
+pub fn join_url_segments(base: &Url, segments: &[&str]) -> Result<Url, AdapterError> {
     let mut url = base.clone();
     {
         let mut path = url
