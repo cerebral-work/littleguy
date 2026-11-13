@@ -106,8 +106,8 @@ pub enum PoolError {
 }
 
 impl PoolError {
-    /// Returns `true` only for startup, configuration, or authentication (`401`/`403`) errors.
-    const fn is_fatal(&self) -> bool {
+    /// Returns `true` only for startup/configuration errors or `401`/`403` on `/v1/mesh/pool/recv`.
+    const fn is_recv_fatal(&self) -> bool {
         match self {
             Self::Transport {
                 status: Some(401 | 403),
@@ -311,12 +311,18 @@ impl PoolClient {
         let resp = self
             .post(&["v1", "mesh", "pool", "recv"], Some(wait_ms), &body)
             .await?;
-        let Ok(Value::Array(items)) = serde_json::from_slice::<Value>(&resp.body) else {
-            tracing::warn!(
-                body_bytes = resp.body.len(),
-                "malformed pool recv payload; skipping cycle"
-            );
-            return Ok(Vec::new());
+        let val = serde_json::from_slice::<Value>(&resp.body).map_err(|e| {
+            PoolError::Decode(format!(
+                "pool recv JSON invalid ({} bytes): {}",
+                resp.body.len(),
+                truncate_chars(&e.to_string(), 200)
+            ))
+        })?;
+        let Value::Array(items) = val else {
+            return Err(PoolError::Decode(format!(
+                "pool recv payload is not a JSON array ({} bytes)",
+                resp.body.len()
+            )));
         };
         Ok(items
             .into_iter()
@@ -726,29 +732,29 @@ impl<R: TurnRunner> PoolWorker<R> {
         let raw = match item {
             RecvItem::Valid(raw) => raw,
             RecvItem::Malformed { raw_token, reason } => {
-                return self.settle_poison(raw_token.as_deref(), &reason).await;
+                return Ok(self.settle_poison(raw_token.as_deref(), &reason).await);
             }
         };
         let Ok(token) = DeliveryToken::new(raw.delivery_token.as_str()) else {
-            return self
+            return Ok(self
                 .settle_poison(
                     Some(raw.delivery_token.as_str()),
                     "refused: invalid delivery_token",
                 )
-                .await;
+                .await);
         };
         let input = match validate_delivery(&raw, &self.config) {
             Ok(valid) => valid,
-            Err(reason) => return self.term_token(token.as_str(), &reason).await,
+            Err(reason) => return Ok(self.term_token(token.as_str(), &reason).await),
         };
         let key = (input.task_id.clone(), input.attempt);
         if let Some(mut hit) = self.cache.get(&key).cloned() {
             hit.refs.insert("stream_seq".into(), json!(raw.stream_seq));
-            return self
+            return Ok(self
                 .send_and_settle(&key, &token, &hit, StepOutcome::ReplayedFromCache)
-                .await;
+                .await);
         }
-        match self.run_with_extend(&token, raw.lease_ms, &input).await {
+        let outcome = match self.run_with_extend(&token, raw.lease_ms, &input).await {
             Ok(out) => {
                 let reply = build_ok_reply(&input, &out, raw.stream_seq);
                 self.put_cache(key.clone(), reply.clone());
@@ -769,14 +775,15 @@ impl<R: TurnRunner> PoolWorker<R> {
                 self.send_and_settle(&key, &token, &reply, StepOutcome::Settled)
                     .await
             }
-        }
+        };
+        Ok(outcome)
     }
 
     /// Runs [`Self::step`] in a loop until `stop` resolves.
     ///
     /// # Errors
     ///
-    /// Propagates startup, configuration, or authentication (`401`/`403`) [`PoolError`] failures.
+    /// Propagates startup/configuration or `/v1/mesh/pool/recv` `401`/`403` [`PoolError`] failures.
     pub async fn run_until(
         &mut self,
         stop: impl Future<Output = ()> + Send,
@@ -786,49 +793,56 @@ impl<R: TurnRunner> PoolWorker<R> {
             tokio::select! {
                 () = &mut stop => return Ok(()),
                 res = self.step() => if let Err(err) = res {
-                    if err.is_fatal() {
+                    if err.is_recv_fatal() {
                         return Err(err);
                     }
                     tracing::warn!(
                         reason = %truncate_chars(&err.to_string(), 256),
                         "pool poll error; backing off"
                     );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::select! {
+                        () = &mut stop => return Ok(()),
+                        () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
                 }
             }
         }
     }
 
-    async fn best_effort_settle(&self, action: &str, body: &Value) -> Result<bool, PoolError> {
+    async fn best_effort_settle(&self, action: &str, body: &Value) -> bool {
         match self.client.settle(action, body).await {
-            Ok(()) => Ok(true),
-            Err(err) if err.is_fatal() => Err(err),
+            Ok(()) => true,
             Err(err) => {
+                let status = match &err {
+                    PoolError::Transport { status, .. } => *status,
+                    _ => None,
+                };
                 tracing::warn!(
                     action,
+                    ?status,
                     reason = %truncate_chars(&err.to_string(), 256),
                     "pool lease settlement failed; continuing"
                 );
-                Ok(false)
+                false
             }
         }
     }
 
-    async fn term_token(&self, token_str: &str, reason: &str) -> Result<StepOutcome, PoolError> {
+    async fn term_confirmed(&self, token_str: &str, reason: &str) -> bool {
         let body = json!({
             "peer_id": self.config.peer_id.as_str(),
             "delivery_token": token_str,
             "reason": truncate_chars(reason, 256),
         });
-        let _ = self.best_effort_settle("term", &body).await?;
-        Ok(StepOutcome::Termed)
+        self.best_effort_settle("term", &body).await
     }
 
-    async fn settle_poison(
-        &self,
-        raw_token: Option<&str>,
-        reason: &str,
-    ) -> Result<StepOutcome, PoolError> {
+    async fn term_token(&self, token_str: &str, reason: &str) -> StepOutcome {
+        let _ = self.term_confirmed(token_str, reason).await;
+        StepOutcome::Termed
+    }
+
+    async fn settle_poison(&self, raw_token: Option<&str>, reason: &str) -> StepOutcome {
         tracing::warn!(
             token_len = raw_token.map_or(0, str::len),
             reason = %truncate_chars(reason, 256),
@@ -841,7 +855,7 @@ impl<R: TurnRunner> PoolWorker<R> {
         }) {
             return self.term_token(tok, reason).await;
         }
-        Ok(StepOutcome::Idle)
+        StepOutcome::Idle
     }
 
     async fn run_with_extend(
@@ -860,7 +874,7 @@ impl<R: TurnRunner> PoolWorker<R> {
         loop {
             tokio::select! {
                 out = &mut fut => return out,
-                _ = ticker.tick() => { let _ = self.client.settle("extend", &ext).await; }
+                _ = ticker.tick() => { let _ = self.best_effort_settle("extend", &ext).await; }
             }
         }
     }
@@ -883,14 +897,14 @@ impl<R: TurnRunner> PoolWorker<R> {
         }
     }
 
-    async fn nack(&self, token: &DeliveryToken) -> Result<StepOutcome, PoolError> {
+    async fn nack(&self, token: &DeliveryToken) -> StepOutcome {
         let body = json!({
             "peer_id": self.config.peer_id.as_str(),
             "delivery_token": token.as_str(),
             "delay_ms": self.config.nack_delay_ms,
         });
-        let _ = self.best_effort_settle("nack", &body).await?;
-        Ok(StepOutcome::Nacked)
+        let _ = self.best_effort_settle("nack", &body).await;
+        StepOutcome::Nacked
     }
 
     async fn send_and_settle(
@@ -899,7 +913,7 @@ impl<R: TurnRunner> PoolWorker<R> {
         token: &DeliveryToken,
         reply: &CachedReply,
         success: StepOutcome,
-    ) -> Result<StepOutcome, PoolError> {
+    ) -> StepOutcome {
         let task_id = &key.0;
         let subject = format!("result {task_id} {}", reply.outcome);
         match self
@@ -912,17 +926,17 @@ impl<R: TurnRunner> PoolWorker<R> {
                     "peer_id": self.config.peer_id.as_str(),
                     "delivery_tokens": [token.as_str()],
                 });
-                let _ = self.best_effort_settle("ack", &ack).await?;
-                Ok(success)
+                let _ = self.best_effort_settle("ack", &ack).await;
+                success
             }
-            Err(err) if err.is_fatal() => Err(err),
             Err(PoolError::Transport {
+                status,
                 retryable: true,
                 message: msg,
-                ..
             }) => {
                 tracing::warn!(
                     %task_id,
+                    ?status,
                     reason = %truncate_chars(&msg, 256),
                     "transient reply send failure; keeping cached reply and nacking"
                 );
@@ -931,8 +945,10 @@ impl<R: TurnRunner> PoolWorker<R> {
             Err(err) => {
                 let reason = format!("send rejected: {}", truncate_chars(&err.to_string(), 200));
                 tracing::warn!(%task_id, %reason, "non-retryable reply send failure; terming");
-                self.remove_cache(key);
-                self.term_token(token.as_str(), &reason).await
+                if self.term_confirmed(token.as_str(), &reason).await {
+                    self.remove_cache(key);
+                }
+                StepOutcome::Termed
             }
         }
     }
