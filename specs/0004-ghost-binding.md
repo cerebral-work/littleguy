@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: implemented
 created: 2026-11-13
 tags: [littleguy, ghost, cortex, spiffe, mandate, littleman, escapement]
 priority: high
@@ -29,9 +29,8 @@ Nothing in this spec does network, file or database I/O.
 | Seat URI `spiffe://unsigned.gg/agent/TEAM/SLUG` | `ghost.rs` `GHOST_SPIFFE_AGENT_PREFIX`, `validate_ghost_spiffe_seat` |
 | Crew refuses a seat, `dormant` and `dreaming` | `ghost.rs` `supports_persistent_seat`, `validate_transition_for` |
 
-`persona_digest` and `handoff_ref` have no cortex counterpart. They are
-littleguy-side optional fields, bounded below. `lifecycle_state` is optional
-here: a delivery may or may not state it.
+`lifecycle_state` is optional here: a delivery may or may not state it.
+Cortex names this field `state` on `GhostLifecycleRecord`.
 
 Deliberate differences from cortex, both stricter:
 - A seat segment (team or slug) is limited to `[a-z0-9-]`. Cortex also allows `_`.
@@ -47,8 +46,6 @@ Cortex does not require the seat slug to equal `ghost_id`, so this spec does not
 | `mitc_principal` | 1 to 128 bytes, no control characters, no leading or trailing space |
 | `spiffe_seat` | at most 256 bytes |
 | seat team, seat slug | 1 to 63 bytes each, `[a-z0-9-]` |
-| `persona_digest` | exactly 64 lowercase hex characters (SHA-256) |
-| `handoff_ref` | 1 to 256 bytes, printable ASCII, no spaces |
 
 ## 4. Requirements (EARS)
 
@@ -69,4 +66,4 @@ Cortex does not require the seat slug to equal `ghost_id`, so this spec does not
 - **REQ-LG-GHOST-08:** `BiscuitMandateClaims` shall accept `spiffe://unsigned.gg/agent/TEAM/SLUG` and `spiffe://unsigned.gg/conclave/CELL/elf/NAME`, and shall refuse other trust domains, `/human/` paths and unknown path shapes.
   Proof: tests `claims_accept_agent_and_elf_spiffe_forms`, `claims_refuse_foreign_human_and_unknown_spiffe`.
 - **REQ-LG-GHOST-09:** Where a `SeatReceipt` carries a `GhostBinding`, the receipt shall expose `ghost_id` and `molt_epoch` through it.
-  Proof: test `seat_receipt_carries_ghost_binding`.
+  Proof: the `GhostBinding` assertions in test `req_orch_seat_01_littleguy_seat_substrate_end_to_end_lifecycle`.
