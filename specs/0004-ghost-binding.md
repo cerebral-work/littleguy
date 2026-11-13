@@ -29,12 +29,24 @@ Nothing in this spec does network, file or database I/O.
 | Seat URI `spiffe://unsigned.gg/agent/TEAM/SLUG` | `ghost.rs` `GHOST_SPIFFE_AGENT_PREFIX`, `validate_ghost_spiffe_seat` |
 | Crew refuses a seat, `dormant` and `dreaming` | `ghost.rs` `supports_persistent_seat`, `validate_transition_for` |
 
-`lifecycle_state` is optional here: a delivery may or may not state it.
-Cortex names this field `state` on `GhostLifecycleRecord`.
+A littleman delivery carries a `GhostBinding`, not a cortex
+`GhostLifecycleRecord`. The binding keeps the cortex field names. `state` is
+optional here (a delivery may or may not state it) and is omitted when absent.
+Unknown JSON fields are refused, so a full cortex record (with `shell_id` or
+`seat_lease`) is refused by design. The sender projects the record to the
+binding fields first. Test `full_cortex_record_fields_are_refused` pins this.
 
-Deliberate differences from cortex, both stricter:
-- A seat segment (team or slug) is limited to `[a-z0-9-]`. Cortex also allows `_`.
-- Unknown JSON fields are refused.
+Deliberate differences from cortex. All are stricter and fail closed:
+
+| Rule here | Cortex rule |
+|---|---|
+| `ghost_id` is `[a-z0-9-]`, 1 to 64 bytes | `new_persistent` (`ghost.rs`, about :457) requires non-blank only |
+| `mitc_principal` refuses control characters and surrounding whitespace, 1 to 128 bytes | non-blank only |
+| A seat segment (team or slug) is `[a-z0-9-]`, at most 63 bytes | `validate_ghost_spiffe_seat` (about :385) also allows `_` and sets no length cap |
+| Unknown JSON fields are refused | `GhostLifecycleRecord` has other fields (`shell_id`, `seat_lease`) |
+
+The shape test pins littleguy's side only. It cannot detect cortex drift,
+because there is no cortex dependency by design.
 
 Cortex does not require the seat slug to equal `ghost_id`, so this spec does not.
 
