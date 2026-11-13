@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Littleman Pool Consumer (`littleguy`, `specs/0005`):** Accept `0`-based explicit `refs.attempt` (`0` and `"0"`) in `lg pool` so first-send deliveries from `escapement-serve` (`escapement-serve/src/pool.rs:596`, `:1193`) run, cache by `(task_id, 0)`, and reply with `refs.attempt = 0` while still refusing non-integers, negatives, signed strings, and values above `u32::MAX` (absent or `null` `refs.attempt` continues to fall back to `delivery_attempt.max(1)`).
+
 ### Added
 
 - **Littleman Pool Consumer (`littleguy`, `littleguy-core`, `specs/0005`):**

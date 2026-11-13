@@ -393,7 +393,7 @@ fn map_adapter_err(err: AdapterError) -> PoolError {
 pub struct TurnInput {
     /// Pool task identifier.
     pub task_id: TaskId,
-    /// 1-based task attempt number.
+    /// Task attempt (`0`-based when `refs.attempt` is set; `delivery_attempt.max(1)` when absent or `null`).
     pub attempt: u32,
     /// Worker shell identifier.
     pub shell_id: ShellId,
@@ -1046,14 +1046,21 @@ fn parse_optional_ghost(val: Option<&Value>) -> Result<Option<GhostBinding>, Str
     }
 }
 
+/// Parses `refs.attempt` for `escapement-serve`, whose task attempts are `0`-based
+/// (`escapement-serve/src/pool.rs:596` sends `"attempt": t.attempt` starting at `0`, and
+/// `escapement-serve/src/pool.rs:1193` ignores replies whose `refs.attempt` mismatches).
+/// When `refs.attempt` is absent or `null`, falls back to Cortex `delivery_attempt.max(1)`.
 fn parse_attempt(val: Option<&Value>, fallback: u32) -> Result<u32, String> {
     let Some(v) = val.filter(|v| !v.is_null()) else {
         return Ok(fallback.max(1));
     };
     v.as_u64()
         .and_then(|n| u32::try_from(n).ok())
-        .or_else(|| v.as_str().and_then(|s| s.parse::<u32>().ok()))
-        .filter(|&n| n >= 1)
+        .or_else(|| {
+            v.as_str()
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|s| s.parse::<u32>().ok())
+        })
         .ok_or_else(|| "refused: invalid attempt".into())
 }
 

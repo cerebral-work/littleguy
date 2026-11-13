@@ -58,7 +58,7 @@ Inbound reply fields and `refs` keys that `escapement-serve` parses:
 | `message.from_session` | `service-pool-littleman-<n>` | `escapement-serve/src/pool.rs:182`, `:472`, `:971` |
 | `message.body` | JSON object text, at most `8_192` bytes | `escapement-serve/src/pool.rs:1005`, `:1013` |
 | `refs.task_id` | Task id string | `escapement-serve/src/pool.rs:960` |
-| `refs.attempt` | Attempt number (`u32`) | `escapement-serve/src/pool.rs:978` |
+| `refs.attempt` | `0`-based attempt (`u32`; explicit `0..=u32::MAX` int or `[0-9]+` string) | `escapement-serve/src/pool.rs:596`, `:978`, `:1193` |
 | `refs.stream_seq` | Delivery stream sequence (`u64`) | `escapement-serve/src/pool.rs:987` |
 | `refs.outcome` | `"ok"` or `"failed"` | `escapement-serve/src/pool.rs:996`, `:999`, `:1021` |
 | `refs.transient` | Boolean retry hint when `"failed"` | `escapement-serve/src/pool.rs:1033` |
@@ -66,12 +66,21 @@ Inbound reply fields and `refs` keys that `escapement-serve` parses:
 | `refs.ghost_id`, `refs.molt_epoch` | Included when `ghost_binding` is present; omitted when absent or `null` | GHOST receipt provenance (`specs/0004`) |
 | `refs.transcript_sha256` | 64-char lowercase hex SHA-256 of the turn transcript | Turn provenance |
 
+`escapement-serve` task attempts are `0`-based: `escapement-serve/src/pool.rs:596`
+sends `"attempt": t.attempt` (`0` on the first send, `1` on the second), and
+`escapement-serve/src/pool.rs:1193` ignores any reply whose `refs.attempt`
+differs from the task's attempt. An explicit `refs.attempt` therefore accepts
+`0..=u32::MAX` (JSON integer or ASCII-digit string) and refuses non-integers,
+negatives, signed strings, and values above `u32::MAX`. When `refs.attempt` is
+absent or `null` (direct mesh probes without `escapement-serve`), `lg pool`
+falls back to Cortex `delivery_attempt.max(1)`.
+
 ## 4. Requirements (EARS)
 
 - **REQ-LG-POOL-01:** When `lg pool` starts, the CLI shall require a hyphenated UUID `--peer-id`, and the loader shall open `--token-file` with `O_NOFOLLOW | O_NONBLOCK` and refuse to start if the opened fd is not a regular file (including symlinks, FIFOs, and directories), has mode other than `0600`, is not owned by the effective UID (`geteuid`), or exceeds `4_096` bytes, without printing the token in `Debug`, logs, or errors.
   Proof: tests `token_file_mode_other_than_0600_or_wrong_owner_refuses_to_start_and_redacts`, `symlink_and_oversize_token_file_are_refused`, `fifo_and_directory_token_paths_are_refused`, `malformed_or_missing_peer_id_is_refused_at_startup`.
-- **REQ-LG-POOL-02:** When `/v1/mesh/pool/recv` returns an empty batch immediately (including `--wait-ms 0`), `run_until` shall enforce a `250 ms` idle poll floor so the worker cannot spin; when `recv` returns invalid JSON or a non-array payload, the client shall return `PoolError::Decode` so `run_until` backs off (`1s`); when a delivery item has a malformed envelope, an invalid `delivery_token`, `from_session` different from `--allowed-sender`, or a field over its section 3 bound, the worker shall log bounded fields, attempt `POST /v1/mesh/pool/term` when the raw token is safe to send (treating `401`/`403`/`410`/`5xx` on `term` as per-delivery outcomes), not run a turn, and continue polling.
-  Proof: tests `wrong_sender_is_refused_with_term_and_runs_no_turn`, `malformed_ghost_binding_and_oversized_body_are_termed_without_turn`, `bad_delivery_token_and_malformed_recv_do_not_stop_worker`, `term_403_on_poison_token_does_not_stop_worker`, `non_array_recv_body_returns_decode_error_and_backs_off`, `empty_recv_with_zero_wait_ms_does_not_spin`.
+- **REQ-LG-POOL-02:** When `/v1/mesh/pool/recv` returns an empty batch immediately (including `--wait-ms 0`), `run_until` shall enforce a `250 ms` idle poll floor so the worker cannot spin; when `recv` returns invalid JSON or a non-array payload, the client shall return `PoolError::Decode` so `run_until` backs off (`1s`); when a delivery item has a malformed envelope, an invalid `delivery_token`, `from_session` different from `--allowed-sender`, an explicit `refs.attempt` outside `0..=u32::MAX` (non-integer, negative, signed string, or `> u32::MAX`), or a field over its section 3 bound, the worker shall log bounded fields, attempt `POST /v1/mesh/pool/term` when the raw token is safe to send (treating `401`/`403`/`410`/`5xx` on `term` as per-delivery outcomes), not run a turn, and continue polling.
+  Proof: tests `wrong_sender_is_refused_with_term_and_runs_no_turn`, `malformed_ghost_binding_and_oversized_body_are_termed_without_turn`, `bad_delivery_token_and_malformed_recv_do_not_stop_worker`, `term_403_on_poison_token_does_not_stop_worker`, `non_array_recv_body_returns_decode_error_and_backs_off`, `empty_recv_with_zero_wait_ms_does_not_spin`, `zero_attempt_number_and_string_run_turn_and_reply_zero`.
 - **REQ-LG-POOL-03:** Where a delivery carries a non-null `ghost_binding`, the worker shall validate it with `littleguy_core::ghost_binding::GhostBinding` and, if invalid, shall call `POST /v1/mesh/pool/term` with a reason and shall not run a turn.
   Proof: test `malformed_ghost_binding_and_oversized_body_are_termed_without_turn`.
 - **REQ-LG-POOL-04:** Where a delivery carries `"ghost_binding": null`, the worker shall treat `ghost_binding` as absent, matching a missing key.
@@ -80,5 +89,5 @@ Inbound reply fields and `refs` keys that `escapement-serve` parses:
   Proof: test `happy_path_runs_turn_extends_lease_sends_reply_and_acks`.
 - **REQ-LG-POOL-06:** When a turn finishes, the worker shall post the bounded result (`refs.error` and `body.error` capped at `1_024` chars) to `POST /v1/mesh/send` and call `POST /v1/mesh/pool/ack`; retryable turn or send failures (`429`/`5xx`/network) shall keep any cached reply and call `nack` with delay, non-retryable send failures shall call `term` with a reason and drop the cached reply only after `term` is confirmed, and `401`/`403` responses shall be fatal only on `/v1/mesh/pool/recv` and startup (never on `ack`, `nack`, `extend`, `term`, or `send`).
   Proof: tests `happy_path_runs_turn_extends_lease_sends_reply_and_acks`, `transient_turn_failure_nacks_with_delay`, `retryable_5xx_on_send_nacks_and_replays_cached_reply`, `non_retryable_422_on_send_settles_delivery_and_handles_next`, `term_failure_after_422_send_keeps_cached_reply_for_redelivery`, `ack_extend_and_send_403_do_not_stop_worker`, `permanent_failure_caps_refs_error_on_char_boundary`.
-- **REQ-LG-POOL-07:** When a `(task_id, attempt)` entry already exists in the bounded result cache, the worker shall re-send the cached reply and call `ack` without running a second turn.
-  Proof: tests `redelivery_resends_cached_reply_without_running_a_second_turn`, `retryable_5xx_on_send_nacks_and_replays_cached_reply`, `term_failure_after_422_send_keeps_cached_reply_for_redelivery`.
+- **REQ-LG-POOL-07:** When a `(task_id, attempt)` entry (including `attempt = 0`) already exists in the bounded result cache, the worker shall re-send the cached reply and call `ack` without running a second turn.
+  Proof: tests `redelivery_resends_cached_reply_without_running_a_second_turn`, `retryable_5xx_on_send_nacks_and_replays_cached_reply`, `term_failure_after_422_send_keeps_cached_reply_for_redelivery`, `zero_attempt_idempotency_cache_replays_and_separates_attempt_one`.
