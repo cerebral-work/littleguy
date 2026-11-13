@@ -89,32 +89,37 @@ defines how Stage B mounts both secret files so `O_NOFOLLOW`, `0600`, and
 
 - `cargo xtask container-check` (invoked by `cargo xtask ci` and the `lint` CI
   job) statically checks `Dockerfile`, `.dockerignore`,
-  `.github/workflows/ci.yml`, and `.github/workflows/build-image.yml` for base
-  digest pins, `-j 2` cargo throttling, final `USER 65532:65532`, `tini`
-  entrypoint, `.dockerignore` exclusions, 40-SHA GitHub Action pins, absence of
-  `:latest` tags, Trivy + Cosign digest signing/attestation, and the missing-secret
-  skip guard.
+  `.github/workflows/ci.yml`, and `.github/workflows/build-image.yml` (ignoring
+  `#` comment lines on required-directive checks) for base digest pins, `-j 2`
+  cargo throttling, final `USER 65532:65532`, `tini` entrypoint, `.dockerignore`
+  exclusions, 40-SHA GitHub Action pins, absence of `:latest` tags, job-level
+  `environment: harbor-publish` on both `preflight` and `publish`, Trivy + Cosign
+  digest signing/attestation, and the missing-secret skip guard.
 - `.github/workflows/ci.yml` adds a `container` job on `ubuntu-latest` that
   builds `Dockerfile` and runs `id -u`, `id -g`, `lg --version`, and
   `lg pool --help` under `--read-only --cap-drop=ALL --security-opt=no-new-privileges`.
 - `.github/workflows/build-image.yml` runs after `CI` succeeds on a `push` to
-  `main` in the canonical repository (`github.event.workflow_run.event == 'push'`
-  and `github.event.workflow_run.head_repository.full_name == github.repository`,
-  refusing fork `workflow_run` events even when a fork branch is named `main`) or
-  via `workflow_dispatch` on `refs/heads/main`. A lightweight `preflight` job
-  checks whether repository secrets `HARBOR_PLATFORM_PUSH_USERNAME`,
-  `HARBOR_PLATFORM_PUSH_PASSWORD`, `COSIGN_PRIVATE_KEY`, and `COSIGN_PASSWORD`
-  are configured; while any secret is absent, `preflight` emits `ready=false`
-  with a notice and the `publish` job (`if: needs.preflight.outputs.ready == 'true'`)
-  skips cleanly without failing CI or creating GitHub Environments. Once armed,
-  `publish` verifies `git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/main`
-  before building, authenticates the Harbor scope preflight via a `0600`
-  `--netrc-file` (never `curl -u` in process `argv`), builds `Dockerfile`,
-  verifies runtime hardening, runs Trivy (`HIGH,CRITICAL --ignore-unfixed --exit-code 1`),
-  pushes immutable tags `git-<12sha>` and `<ver>-<7sha>` (plus `v<ver>` if
-  absent, never `:latest`) to `harbor.unsigned.gg/platform/littleguy`, signs the
-  `sha256` manifest digest with Cosign (`--tlog-upload=false`), attaches and
-  verifies a Syft CycloneDX 1.5 attestation, and writes the pinned digest to
+  `main` in the canonical repository (`github.event.workflow_run.event == 'push'`,
+  `github.event.workflow_run.head_repository.full_name == github.repository`, and
+  `github.event.workflow_run.head_branch == 'main'`, refusing fork `workflow_run`
+  events even when a fork branch is named `main`) or via `workflow_dispatch` on
+  `refs/heads/main`. Both `preflight` and `publish` bind GitHub Environment
+  `harbor-publish` (restricted by deployment branch policy to `main`) so
+  environment-scoped credentials are visible to both the readiness check and the
+  image push. `preflight` checks whether `Environment harbor-publish` secrets
+  `HARBOR_PLATFORM_PUSH_USERNAME`, `HARBOR_PLATFORM_PUSH_PASSWORD`,
+  `COSIGN_PRIVATE_KEY`, and `COSIGN_PASSWORD` are configured; while any secret is
+  absent, `preflight` emits `ready=false` with a notice and `publish`
+  (`if: needs.preflight.outputs.ready == 'true'`) skips cleanly without failing
+  CI. Once armed, `publish` verifies
+  `git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/main` before
+  building, authenticates the Harbor scope preflight via a `0600` `--netrc-file`
+  (never `curl -u` in process `argv`), builds `Dockerfile`, verifies runtime
+  hardening, runs Trivy (`HIGH,CRITICAL --ignore-unfixed --exit-code 1`), pushes
+  immutable tags `git-<12sha>` and `<ver>-<7sha>` (plus `v<ver>` if absent, never
+  `:latest`) to `harbor.unsigned.gg/platform/littleguy`, signs the `sha256`
+  manifest digest with Cosign (`--tlog-upload=false`), attaches and verifies a
+  Syft CycloneDX 1.5 attestation, and writes the pinned digest to
   `$GITHUB_STEP_SUMMARY`.
 
 ### 4. Stage B Kubernetes Secret Volume Contract (Parts 2 and 3)
@@ -173,14 +178,17 @@ stage both secrets into a memory `emptyDir` via an `initContainer`:
   and `tini`, writable `0700` `/data` owned by `65532:65532`, and final runtime
   identity `USER 65532:65532` compatible with `readOnlyRootFilesystem: true`,
   `--cap-drop=ALL`, and `allowPrivilegeEscalation: false`.
-- **REQ-LG-CONT-03:** `cargo xtask container-check` (wired into `cargo xtask ci`),
+- **REQ-LG-CONT-03:** `cargo xtask container-check` (wired into `cargo xtask ci`
+  and ignoring `#` comment lines on required-directive checks),
   `.github/workflows/ci.yml` (`container` job), and
   `.github/workflows/build-image.yml` shall enforce container, workflow, Trivy,
-  and Cosign supply-chain invariants, restrict `workflow_run` triggers to
-  same-repository `push` events on `main` verified as ancestors of `origin/main`,
-  pass Harbor preflight credentials via a `0600` `--netrc-file` rather than
-  `curl -u` `argv`, and skip the Harbor `publish` job cleanly whenever Harbor or
-  Cosign repository secrets are absent.
+  and Cosign supply-chain invariants, bind both `preflight` and `publish` jobs
+  to GitHub Environment `harbor-publish` (restricted to `main`), restrict
+  `workflow_run` triggers to same-repository `push` events on `main`
+  (`head_branch == 'main'`) verified as ancestors of `origin/main`, pass Harbor
+  preflight credentials via a `0600` `--netrc-file` rather than `curl -u` `argv`,
+  and skip the Harbor `publish` job cleanly whenever Harbor or Cosign secrets in
+  `Environment harbor-publish` are absent.
 - **REQ-LG-CONT-04:** Stage B Kubernetes manifests in `unsigned-paas` (Parts 2
   and 3) shall stage `ExternalSecret`-backed `token` and `llm-key` files into an
   in-memory `emptyDir` (`/run/littleman`) as regular `0600` files owned by UID
