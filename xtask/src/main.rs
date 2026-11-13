@@ -10,6 +10,7 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
+mod container;
 mod verus;
 
 /// Repository automation for littleguy.
@@ -33,7 +34,9 @@ enum Command {
     Coverage(CoverageArgs),
     /// Verify the Verus proofs in `formal/verus`.
     Verus,
-    /// Run fmt, clippy and test, in that order. The pre-push gate.
+    /// Check container and workflow supply-chain invariants.
+    ContainerCheck,
+    /// Run fmt, clippy, container-check and test, in that order. The pre-push gate.
     Ci,
 }
 
@@ -112,9 +115,11 @@ fn run(command: &Command) -> Result<()> {
         Command::Test => test(),
         Command::Coverage(args) => coverage(args),
         Command::Verus => verus::check(&repo_root()),
+        Command::ContainerCheck => container::check(&repo_root()),
         Command::Ci => {
             fmt()?;
             clippy()?;
+            container::check(&repo_root())?;
             test()
         }
     }
@@ -149,7 +154,15 @@ mod tests {
 
     #[test]
     fn the_cli_parses_every_command() {
-        for name in ["fmt", "clippy", "test", "verus", "ci", "coverage"] {
+        for name in [
+            "fmt",
+            "clippy",
+            "test",
+            "verus",
+            "container-check",
+            "ci",
+            "coverage",
+        ] {
             assert!(Cli::try_parse_from(["xtask", name]).is_ok(), "{name}");
         }
         let cli = Cli::try_parse_from(["xtask", "coverage", "--fail-under", "90"]).unwrap();

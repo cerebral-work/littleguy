@@ -14,8 +14,8 @@
 //! `[[camel.route]]` of the config feeds the assistant too.
 //!
 //! `lg serve --model claude`, `openai` or `openrouter` talks to a hosted
-//! model. Each reads its key from the environment only, so the key never
-//! shows in a process list.
+//! model. Each reads its key from `--api-key-file` or the environment, so the
+//! key never shows in a process list.
 
 mod approvals;
 mod brief;
@@ -41,6 +41,7 @@ use anyhow::{Context, Result};
 use autumn_harvest_agent::AgentModel;
 use clap::{Parser, Subcommand, ValueEnum};
 use littleguy::pool::{self, PoolClient, PoolConfig, PoolToken, PoolWorker, RuntimeTurnRunner};
+use littleguy::secret_file::SecretFile;
 use littleguy_channels::{DiscordRest, SlackApi, discord, slack};
 use littleguy_core::{Config, OwnerName, PoolPeerId, RoleName, ShellId};
 use littleguy_models::{ClaudeModel, OfflineModel, OpenAiModel, Provider};
@@ -162,6 +163,10 @@ struct ServeArgs {
     /// Defaults to the provider's own.
     #[arg(long, env = "LG_BASE_URL")]
     base_url: Option<String>,
+    /// Regular `0600` file owned by the current user holding the model API key.
+    /// Overrides `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `OPENROUTER_API_KEY`.
+    #[arg(long, env = "LG_API_KEY_FILE")]
+    api_key_file: Option<PathBuf>,
     /// The Messages API endpoint. For tests.
     #[arg(long, env = "LG_CLAUDE_ENDPOINT", hide = true)]
     claude_endpoint: Option<String>,
@@ -237,10 +242,19 @@ fn build_model(
     db: &Path,
     key: impl Fn(&str) -> Option<String>,
 ) -> Result<Arc<dyn AgentModel>> {
+    let file_key = args
+        .api_key_file
+        .as_deref()
+        .map(SecretFile::load)
+        .transpose()
+        .context("invalid --api-key-file")?;
     let key_of = |var: &str, model: &str| {
+        if let Some(secret) = &file_key {
+            return Ok(secret.expose_secret().to_owned());
+        }
         key(var)
             .filter(|key| !key.trim().is_empty())
-            .with_context(|| format!("set {var} to run --model {model}"))
+            .with_context(|| format!("pass --api-key-file or set {var} to run --model {model}"))
     };
     Ok(match args.model {
         ModelChoice::Offline => Arc::new(
@@ -733,5 +747,102 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn api_key_file_feeds_models_and_overrides_environment() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("llm-key");
+        std::fs::write(&key_path, "sk-file-secret-123\n").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let db = Path::new("/d/lg.db");
+
+        for (model_flag, extra, expected_id) in [
+            (
+                "claude",
+                vec![],
+                "claude-opus-5-5+effort=high+fallbacks=default",
+            ),
+            ("openai", vec!["--model-name", "gpt-x"], "openai:gpt-x"),
+            ("openrouter", vec!["--model-name", "a/b"], "openrouter:a/b"),
+        ] {
+            let key_str = key_path.to_str().unwrap();
+            let mut words = vec![
+                "lg",
+                "serve",
+                "--model",
+                model_flag,
+                "--api-key-file",
+                key_str,
+            ];
+            words.extend(extra);
+            let parsed = serve_args(&words);
+            let built = build_model(&parsed, db, |_| None).unwrap();
+            assert_eq!(built.model_id(), Some(expected_id));
+        }
+
+        let key_str = key_path.to_str().unwrap();
+        let args = serve_args(&[
+            "lg",
+            "serve",
+            "--model",
+            "openai",
+            "--model-name",
+            "gpt-x",
+            "--api-key-file",
+            key_str,
+        ]);
+        let built = build_model(&args, db, |_| Some(String::from(" "))).unwrap();
+        assert_eq!(built.model_id(), Some("openai:gpt-x"));
+    }
+
+    #[test]
+    fn bad_api_key_file_fails_closed_even_for_offline_and_redacts() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("bad-key");
+        let leaked = "sk-do-not-print-me-777";
+        std::fs::write(&key_path, leaked).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let key_str = key_path.to_str().unwrap();
+        let args = serve_args(&[
+            "lg",
+            "serve",
+            "--model",
+            "offline",
+            "--api-key-file",
+            key_str,
+        ]);
+        let err = build_model(&args, Path::new("/d/lg.db"), |_| None)
+            .err()
+            .unwrap();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("invalid --api-key-file"));
+        assert!(!rendered.contains(leaked));
+
+        let cli = Cli::try_parse_from([
+            "lg",
+            "pool",
+            "--cortex-url",
+            "http://127.0.0.1:9999",
+            "--token-file",
+            "/tmp/token",
+            "--peer-id",
+            "11111111-1111-1111-1111-111111111111",
+            "--shell-id",
+            "shell-01",
+            "--api-key-file",
+            key_str,
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Pool(pool_args) => {
+                assert_eq!(pool_args.serve.api_key_file, Some(key_path));
+            }
+            _ => panic!("expected pool command"),
+        }
     }
 }
