@@ -1119,4 +1119,41 @@ mod tests {
             Err(MandateBridgeError::AttenuationWidening { .. })
         ));
     }
+
+    // REQ-LG-GHOST-08: the claims accept the Ghost seat and elf forms.
+    #[test]
+    fn claims_accept_agent_and_elf_spiffe_forms() {
+        for id in [
+            "spiffe://unsigned.gg/agent/platform/sadr",
+            "spiffe://unsigned.gg/conclave/ceres/elf/w1",
+        ] {
+            let mut claims = sample_claims();
+            claims.spiffe_id = id.to_owned();
+            assert!(
+                claims
+                    .compile_to_harvest_mandate(SandboxClass::Kata, 1_750_000_000_000)
+                    .is_ok(),
+                "claims must accept {id}"
+            );
+        }
+    }
+
+    // REQ-LG-GHOST-08: the claims refuse foreign domains, `/human/` and unknown shapes.
+    #[test]
+    fn claims_refuse_foreign_human_and_unknown_spiffe() {
+        for id in [
+            "spiffe://cerebral.internal/agent/platform/sadr",
+            "spiffe://unsigned.gg/human/ctodie",
+            "spiffe://unsigned.gg/wizard/platform/sadr",
+        ] {
+            let mut claims = sample_claims();
+            claims.spiffe_id = id.to_owned();
+            assert!(
+                claims
+                    .compile_to_harvest_mandate(SandboxClass::Kata, 1_750_000_000_000)
+                    .is_err(),
+                "claims must refuse {id}"
+            );
+        }
+    }
 }

@@ -1126,6 +1126,9 @@ pub struct SeatReceipt {
     pub transcript_sha256: Option<String>,
     /// Attached Wheelhorse gate record that authorized the job.
     pub wheelhorse_record: WheelhorseGateRecord,
+    /// The validated Ghost binding the seat embodied, when the delivery carried one (spec 0004).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ghost_binding: Option<crate::ghost_binding::GhostBinding>,
 }
 
 /// Job specification submitted to a seat (`vespertin/specs/uas/0027` `JobSpec`).
@@ -1533,6 +1536,7 @@ impl LittleguySeatSubstrate {
             closure: closure.into(),
             transcript_sha256,
             wheelhorse_record: gate_record,
+            ghost_binding: None,
         };
         self.jobs.insert(key, SeatJobState::Done(receipt.clone()));
         Ok(receipt)
@@ -2325,6 +2329,24 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.head_branch, "pool/act_18cf144b5df69451006");
         assert_eq!(receipt.wheelhorse_record.decision, "pass");
+
+        // REQ-LG-GHOST-09: the receipt carries a Ghost binding and round-trips it.
+        assert!(receipt.ghost_binding.is_none());
+        let binding: crate::ghost_binding::GhostBinding = serde_json::from_str(
+            r#"{"ghost_id":"sadr","manifestation":"agent","mitc_principal":"ctodie","spiffe_seat":"spiffe://unsigned.gg/agent/platform/sadr","molt_epoch":3}"#,
+        )
+        .unwrap();
+        let mut ghosted = receipt.clone();
+        ghosted.ghost_binding = Some(binding);
+        let json = serde_json::to_string(&ghosted).unwrap();
+        let back: SeatReceipt = serde_json::from_str(&json).unwrap();
+        let carried = back.ghost_binding.as_ref().unwrap();
+        assert_eq!((carried.ghost_id(), carried.molt_epoch()), ("sadr", 3));
+        assert!(
+            !serde_json::to_string(&receipt)
+                .unwrap()
+                .contains("ghost_binding")
+        );
 
         let md = substrate.render_aeo_markdown();
         assert!(md.contains("alpheratz"));
