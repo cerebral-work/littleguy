@@ -1,14 +1,14 @@
 # Builds, scans, pushes, signs, and attests `harbor.unsigned.gg/platform/littleguy`
 # (`specs/0006`, `REQ-LG-CONT-03`).
 #
-# Required repository secrets (operator-gated; while any secret is absent, the
-# `preflight` job emits `ready=false` and `publish` skips cleanly without
-# creating GitHub Environments or failing CI):
+# Required secrets in GitHub Environment `harbor-publish` (restricted by branch
+# policy to `main`; operator-gated; while any secret is absent, the `preflight`
+# job emits `ready=false` and `publish` skips cleanly without failing CI):
 #   - HARBOR_PLATFORM_PUSH_USERNAME
 #   - HARBOR_PLATFORM_PUSH_PASSWORD
 #   - COSIGN_PRIVATE_KEY
 #   - COSIGN_PASSWORD
-# Optional repository secret:
+# Optional secret in GitHub Environment `harbor-publish`:
 #   - KYVERNO_COSIGN_PUBLIC_KEY (when set, verifies signature and attestation
 #     against the cluster admission public key in addition to the key's own
 #     derived public key)
@@ -43,12 +43,13 @@ jobs:
        github.event.workflow_run.head_repository.full_name == github.repository &&
        github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
+    environment: harbor-publish
     timeout-minutes: 5
     outputs:
       ready: ${{ steps.secrets.outputs.ready }}
       sha: ${{ steps.secrets.outputs.sha }}
     steps:
-      - name: Check branch and repository secrets
+      - name: Check branch and Environment harbor-publish secrets
         id: secrets
         env:
           HAS_HARBOR_USER: ${{ secrets.HARBOR_PLATFORM_PUSH_USERNAME != '' }}
@@ -79,7 +80,7 @@ jobs:
           [ "$HAS_COSIGN_KEY" = "true" ] || missing="$missing COSIGN_PRIVATE_KEY"
           [ "$HAS_COSIGN_PASS" = "true" ] || missing="$missing COSIGN_PASSWORD"
           if [ -n "$missing" ]; then
-            echo "::notice::Skipping Harbor publish for $target_sha; unseeded repository secrets:$missing"
+            echo "::notice::Skipping Harbor publish for $target_sha; unseeded Environment harbor-publish secrets:$missing"
             echo "ready=false" >> "$GITHUB_OUTPUT"
           else
             echo "ready=true" >> "$GITHUB_OUTPUT"
@@ -90,6 +91,7 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.ready == 'true'
     runs-on: ubuntu-latest
+    environment: harbor-publish
     timeout-minutes: 60
     outputs:
       digest: ${{ steps.sign.outputs.digest }}

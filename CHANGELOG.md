@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Harbor Publish Environment Binding (`littleguy`, `xtask`, `specs/0006`):** Bound both `preflight` and `publish` jobs in `.github/workflows/build-image.yml` to GitHub Environment `harbor-publish` (restricted to `main`) so environment-scoped Harbor and Cosign secrets are visible to both readiness checks and image publishing, and hardened `cargo xtask container-check` to require job-level `environment: harbor-publish` on both jobs, require `github.event.workflow_run.head_branch == 'main'`, and ignore `#` comment lines on required-directive checks.
 - **Littleman Pool Consumer (`littleguy`, `specs/0005`):** Accept `0`-based explicit `refs.attempt` (`0` and `"0"`) in `lg pool` so first-send deliveries from `escapement-serve` (`escapement-serve/src/pool.rs:596`, `:1193`) run, cache by `(task_id, 0)`, and reply with `refs.attempt = 0` while still refusing non-integers, negatives, signed strings, and values above `u32::MAX` (absent or `null` `refs.attempt` continues to fall back to `delivery_attempt.max(1)`).
 
 ### Added
