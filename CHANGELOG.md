@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Camel & `zip` Dependency Upgrade (`EST-1604`, `littleguy`):** Upgraded `camel-*` from `0.57` to `0.59` (with an unmodified `harvest-camel 0.4.0` `[patch.crates-io]` compatibility shim on `camel-* = "0.59"` until upstream publishes `harvest-camel > 0.4.0`), moving `Cargo.lock` from `zip 8.6.0` to `zip >= 9.0.5` and closing all 5 `zip` Dependabot alerts (`GHSA-m665-v7pm-7grj`, `GHSA-9hj8-73fh-9963`, `GHSA-hjqx-j4rw-g7xv`, `GHSA-q7v9-x93c-xqv3`, `GHSA-8hxf-qr8p-62x4`).
+
 ### Fixed
 
 - **Littleman Pool Consumer (`littleguy`, `specs/0005`):** Accept `0`-based explicit `refs.attempt` (`0` and `"0"`) in `lg pool` so first-send deliveries from `escapement-serve` (`escapement-serve/src/pool.rs:596`, `:1193`) run, cache by `(task_id, 0)`, and reply with `refs.attempt = 0` while still refusing non-integers, negatives, signed strings, and values above `u32::MAX` (absent or `null` `refs.attempt` continues to fall back to `delivery_attempt.max(1)`).

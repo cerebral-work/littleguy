@@ -18,14 +18,14 @@ autumn-harvest = { workspace = true, features = ["sandbox-activities"] }
 autumn-harvest-agent = { workspace = true, features = ["sandbox"] }
 autumn-harvest-plugin = { workspace = true }
 autumn-harvest-sqlite = { workspace = true }
-camel-api = "0.57"
+camel-api = "0.59"
 chrono = "0.4"
-camel-builder = "0.57"
-camel-component-api = "0.57"
-camel-component-direct = "0.57"
-camel-component-file = "0.57"
-camel-component-timer = "0.57"
-camel-core = "0.57"
+camel-builder = "0.59"
+camel-component-api = "0.59"
+camel-component-direct = "0.59"
+camel-component-file = "0.59"
+camel-component-timer = "0.59"
+camel-core = "0.59"
 harvest-camel = { version = "0.4", default-features = false, features = ["sqlite"] }
 clap = { workspace = true }
 getrandom = "0.4"

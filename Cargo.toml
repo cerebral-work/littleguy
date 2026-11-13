@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["patches/harvest-camel"]
 members = [
     "crates/littleguy",
     "crates/littleguy-channels",
@@ -50,3 +51,12 @@ pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 expect_used = "warn"
+
+# EST-1604: `camel-processor` moved from `zip = "8"` to `zip = "9"` in 0.59.0,
+# closing 5 `zip` 8.6.0 Dependabot advisories (including critical
+# GHSA-m665-v7pm-7grj, patched in `zip >= 9.0.5`). Published `harvest-camel`
+# 0.4.0 (`autumn-foundation/harvest-camel@164a158a`) still pins `camel-* = "0.57"`;
+# `patches/harvest-camel` carries unmodified 0.4.0 `src/` with `camel-*` bumped
+# to `"0.59"` until upstream publishes `harvest-camel > 0.4.0`.
+[patch.crates-io]
+harvest-camel = { path = "patches/harvest-camel" }

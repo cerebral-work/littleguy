@@ -781,7 +781,7 @@ dependencies = [
  "arrayvec",
  "cc",
  "cfg-if",
- "constant_time_eq",
+ "constant_time_eq 0.4.2",
  "cpufeatures 0.3.1",
 ]
 
@@ -890,9 +890,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "camel-api"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a68c099293a4a4adbd7251b636c401746f288d071b1b1e91340486fc161fbed"
+checksum = "5632ca77b3c9687ff2192304ee1e3c3bbc903152720be4378d6de3e47f23e6ef"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -917,9 +917,9 @@ dependencies = [
 
 [[package]]
 name = "camel-auth"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "682a56c25e37439839239ed05d132531ec7b0c7aac544679e67752263f3561c9"
+checksum = "596c81c1829a1e29a8801b856e3e805b1f26ef57e1112f4002ad5fbbf8785fec"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -944,9 +944,9 @@ dependencies = [
 
 [[package]]
 name = "camel-bean"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "636fea1163e9c691927ee1ed810474eb1b01fb491f0b80e0a9850fd1f87c675d"
+checksum = "ce8723215eeb008f4e524ebe6169b332efd477b8eb488ee382f997bf4010244c"
 dependencies = [
  "async-trait",
  "camel-api",
@@ -960,9 +960,9 @@ dependencies = [
 
 [[package]]
 name = "camel-bean-macros"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a8b944b4adbfedfdf702a80744f4a538699ad2a411e401a7cabbcf2bda579ca"
+checksum = "c3ff80a9924daa36f16c54981580504f6e6a63d5806b388e0ab5111c797446d8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -972,9 +972,9 @@ dependencies = [
 
 [[package]]
 name = "camel-builder"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19f724dce2baf5f49a4a1c15c634093e8a775e7a6fe0ea084fece43bf3b0260d"
+checksum = "08c07b2aff4c8752f9b475a94f835a7e6d2039b5a6fc76201f87eec8e3fec86c"
 dependencies = [
  "camel-api",
  "camel-auth",
@@ -988,9 +988,9 @@ dependencies = [
 
 [[package]]
 name = "camel-component-api"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51ffd971bfa8c0f8bded145881ab12632acc2aad627754d77a15bd8fa16e4686"
+checksum = "065ed9b08ba2498fdf64e934a4c19bdf3c2a95dc926b6228b0a8cd6c01783966"
 dependencies = [
  "async-trait",
  "camel-api",
@@ -1013,9 +1013,9 @@ dependencies = [
 
 [[package]]
 name = "camel-component-direct"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51fa5d27d439d7b987313902ebdc2044503474a4426e60274f8f0659bb22e1a5"
+checksum = "645fadf5789430bc67bb10f5c7255537a4e1e1ba818b9b5182e69b06b4fed486"
 dependencies = [
  "async-trait",
  "camel-api",
@@ -1028,9 +1028,9 @@ dependencies = [
 
 [[package]]
 name = "camel-component-file"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f0db14c71c2a3d045fd32ac101b313746455819f8ee7fea3fca5e139729cbfe"
+checksum = "e3b3288c689f9e519a39ed114944402e08f5d2cd40688c34fd15d55deded2424"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1056,9 +1056,9 @@ dependencies = [
 
 [[package]]
 name = "camel-component-timer"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1dc6f07d950f1249afe59a87e82516ff96dd9139fb519dc0d362e5527def19ae"
+checksum = "7fe2a4ce279288816a729263d3ec4ccc8380c076820c3a91759d66558d18d72b"
 dependencies = [
  "async-trait",
  "camel-api",
@@ -1072,9 +1072,9 @@ dependencies = [
 
 [[package]]
 name = "camel-core"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8f66a1c08d7c6665f44f60c53e809f7af7bf53986a896abd850d45f14935144"
+checksum = "8738c05899e087590bbab8f07bdc0982bc8483103e29295d13b49dbd722c04a9"
 dependencies = [
  "arc-swap",
  "async-stream",
@@ -1110,9 +1110,9 @@ dependencies = [
 
 [[package]]
 name = "camel-endpoint"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abac4d9948ab2e74c6e305372e7a93f2417f987a63ef552ae40adb55ae789b01"
+checksum = "782f12b9208c10ee8c4d9e7942a64e96ee69e5c00e4d0fd2fc135385c5e5d181"
 dependencies = [
  "async-trait",
  "camel-api",
@@ -1124,9 +1124,9 @@ dependencies = [
 
 [[package]]
 name = "camel-endpoint-macros"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5853a58ca00786a6345e1f50b944674f8ef397c80b650d1ef26c61977e9dd3db"
+checksum = "a1d42a4d0ef70a828d9e18466cca6caae12ca4130d56ff647ad5c63dccb0a80f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1135,9 +1135,9 @@ dependencies = [
 
 [[package]]
 name = "camel-language-api"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34c15ba21a583c3424d838bb8415b2411f6e14b65b4d00b88c20d744e3f85bf1"
+checksum = "d4962d6ae82f0e8f95e0931fd424c0234f5edab2e96cb21614fdaa11e7deb77e"
 dependencies = [
  "async-trait",
  "camel-api",
@@ -1147,9 +1147,9 @@ dependencies = [
 
 [[package]]
 name = "camel-language-simple"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "011396eaa7f05c66e48f83a467453b5ceb55d3d8c5819b44a5d4cde9c9bb0e20"
+checksum = "5a9b2a387303d73aa44bb818cfbfc1f78c2c16f49fb3984ec73482fe171a7988"
 dependencies = [
  "async-trait",
  "camel-api",
@@ -1159,9 +1159,9 @@ dependencies = [
 
 [[package]]
 name = "camel-processor"
-version = "0.57.0"
+version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af73b31692241d2473abea0a0cddfa95ab68077879f0d8e3711315f6c5dac718"
+checksum = "ce5707cf8ac308e238c35773201022f10b1a560568ec8f9087f21a2d96127efa"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1422,6 +1422,15 @@ name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb6feb175df65d0a3ccd3e73484e940d0ac664e8034f0519fd49a93db3071d9"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "core-foundation"
@@ -2613,8 +2622,6 @@ dependencies = [
 [[package]]
 name = "harvest-camel"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93d9dd411ba4767386729ff11339ba51a0b602fa406853cfbd1eea14a8c9dffc"
 dependencies = [
  "async-trait",
  "autumn-harvest",
@@ -6403,9 +6410,9 @@ dependencies = [
 
 [[package]]
 name = "typed-path"
-version = "0.12.4"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54ec2755506471f54baf5e4bb5499d8e510cc1caf271270e778a736bd2d7336c"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
 
 [[package]]
 name = "typenum"
@@ -7306,15 +7313,21 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
+version = "9.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+checksum = "e3476fd497ac8af5b1ec7b51acab7bef380f7e8dd8e0487595bafd839417a302"
 dependencies = [
+ "constant_time_eq 0.6.1",
  "crc32fast",
  "flate2",
+ "getrandom 0.4.3",
  "indexmap",
+ "libc",
  "memchr",
+ "nix",
  "typed-path",
+ "windows-sys 0.61.2",
+ "zeroize",
  "zopfli",
 ]
 

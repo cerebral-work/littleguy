@@ -1,0 +1,46 @@
+[package]
+name = "harvest-camel"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+description = "Bridge rust-camel's connectors and routing into autumn-harvest's durable workflows"
+repository = "https://github.com/autumn-foundation/harvest-camel"
+readme = "README.md"
+keywords = ["camel", "workflow", "integration", "durable", "eip"]
+categories = ["asynchronous", "network-programming"]
+
+[dependencies]
+autumn-harvest = "0.10.0"
+autumn-harvest-plugin = { version = "0.10.0", features = ["connectors"] }
+camel-api = "0.59"
+camel-component-api = "0.59"
+camel-core = "0.59"
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+async-trait = "0.1"
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+# Claim table and external-task settlement. Versions match autumn-harvest
+# 0.10.0 so the pool type is the engine's own `DbPool`.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+deadpool = { version = "0.13", optional = true }
+diesel = { version = "2.3", features = ["postgres_backend", "uuid", "chrono"], optional = true }
+diesel-async = { version = "0.9", features = ["deadpool", "postgres"], optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+# The SQLite inbound bridge. The version matches autumn-harvest 0.10.0.
+autumn-harvest-sqlite = { version = "0.10.0", optional = true }
+
+[features]
+default = ["postgres"]
+# The request/reply bridge and its claim table, on Postgres.
+postgres = ["dep:deadpool", "dep:diesel", "dep:diesel-async", "dep:tokio-util", "dep:uuid"]
+# The inbound bridge onto a caller-owned SQLite runtime.
+sqlite = ["dep:autumn-harvest-sqlite"]
+
+[dev-dependencies]
+autumn-harvest = { version = "0.10.0", features = ["testing"] }
+camel-builder = "0.59"
+camel-component-direct = "0.59"
