@@ -30,6 +30,8 @@ const PEER_ID: &str = "11111111-1111-1111-1111-111111111111";
 #[derive(Default)]
 struct StubData {
     deliveries: VecDeque<Value>,
+    recv_raw: VecDeque<(StatusCode, String)>,
+    send_statuses: VecDeque<StatusCode>,
     recvs: Vec<(Option<String>, Value)>,
     acks: Vec<String>,
     extends: Vec<String>,
@@ -46,51 +48,63 @@ async fn stub_post(
     headers: HeaderMap,
     uri: Uri,
     Json(b): Json<Value>,
-) -> Result<(StatusCode, Json<Value>), StatusCode> {
+) -> (StatusCode, [(&'static str, &'static str); 1], String) {
+    let reply =
+        |code: StatusCode, body: String| (code, [("content-type", "application/json")], body);
     let authed = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v == format!("Bearer {SECRET}"));
     if !authed {
-        return Err(StatusCode::UNAUTHORIZED);
+        return reply(StatusCode::UNAUTHORIZED, "{}".to_owned());
     }
     let mut g = stub.0.lock().unwrap_or_else(PoisonError::into_inner);
     let res = match uri.path() {
         "/v1/mesh/pool/recv" => {
             g.recvs.push((uri.query().map(str::to_owned), b));
-            let items: Vec<Value> = g.deliveries.pop_front().into_iter().collect();
-            Ok((StatusCode::OK, Json(Value::Array(items))))
+            if let Some((code, raw)) = g.recv_raw.pop_front() {
+                reply(code, raw)
+            } else {
+                let items: Vec<Value> = g.deliveries.pop_front().into_iter().collect();
+                reply(StatusCode::OK, Value::Array(items).to_string())
+            }
         }
         "/v1/mesh/pool/ack" => {
             if let Some(arr) = b["delivery_tokens"].as_array() {
                 g.acks
                     .extend(arr.iter().filter_map(Value::as_str).map(str::to_owned));
             }
-            Ok((StatusCode::NO_CONTENT, Json(Value::Null)))
+            reply(StatusCode::NO_CONTENT, String::new())
         }
         "/v1/mesh/pool/extend" => {
             if let Some(tok) = b["delivery_token"].as_str() {
                 g.extends.push(tok.to_owned());
             }
-            Ok((StatusCode::NO_CONTENT, Json(Value::Null)))
+            reply(StatusCode::NO_CONTENT, String::new())
         }
         "/v1/mesh/pool/nack" => {
             let tok = b["delivery_token"].as_str().unwrap_or_default().to_owned();
             let ms = u32::try_from(b["delay_ms"].as_u64().unwrap_or(0)).unwrap_or(0);
             g.nacks.push((tok, ms));
-            Ok((StatusCode::NO_CONTENT, Json(Value::Null)))
+            reply(StatusCode::NO_CONTENT, String::new())
         }
         "/v1/mesh/pool/term" => {
             let tok = b["delivery_token"].as_str().unwrap_or_default().to_owned();
             let why = b["reason"].as_str().unwrap_or_default().to_owned();
             g.terms.push((tok, why));
-            Ok((StatusCode::NO_CONTENT, Json(Value::Null)))
+            reply(StatusCode::NO_CONTENT, String::new())
         }
         "/v1/mesh/send" => {
             g.sends.push(b);
-            Ok((StatusCode::OK, Json(json!({ "delivered": 1 }))))
+            let code = g.send_statuses.pop_front().unwrap_or(StatusCode::OK);
+            let body = if code.is_success() {
+                json!({ "delivered": 1 }).to_string()
+            } else {
+                json!({ "error": "rejected" }).to_string()
+            };
+            reply(code, body)
         }
-        _ => Err(StatusCode::NOT_FOUND),
+        _ => reply(StatusCode::NOT_FOUND, "{}".to_owned()),
     };
     drop(g);
     res
@@ -359,7 +373,7 @@ async fn transient_turn_failure_nacks_with_delay() -> TestResult {
 #[test]
 fn token_file_mode_other_than_0600_or_wrong_owner_refuses_to_start_and_redacts() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let uid = rustix::process::getuid().as_raw();
+    let uid = rustix::process::geteuid().as_raw();
     let bad_mode = write_token_file(dir.path(), 0o644)?;
     assert!(matches!(
         PoolToken::load_for_uid(&bad_mode, uid),
@@ -368,7 +382,14 @@ fn token_file_mode_other_than_0600_or_wrong_owner_refuses_to_start_and_redacts()
     let out = Command::new(LG)
         .args(["pool", "--cortex-url", "http://127.0.0.1:9", "--token-file"])
         .arg(&bad_mode)
-        .args(["--wait-ms", "100", "--shell-id", "shell-cli"])
+        .args([
+            "--peer-id",
+            PEER_ID,
+            "--wait-ms",
+            "100",
+            "--shell-id",
+            "shell-cli",
+        ])
         .env("LG_LOG", "warn")
         .output()?;
     assert!(!out.status.success());
@@ -395,5 +416,143 @@ fn token_file_mode_other_than_0600_or_wrong_owner_refuses_to_start_and_redacts()
         .err()
         .ok_or("expected invalid token")?;
     assert!(!err.to_string().contains(SECRET) && !format!("{err:?}").contains(SECRET));
+    Ok(())
+}
+
+struct PermanentFailRunner(String);
+impl TurnRunner for PermanentFailRunner {
+    fn run_turn<'a>(&'a self, _: &'a TurnInput) -> BoxFuture<'a, Result<TurnOutput, TurnError>> {
+        let msg = self.0.clone();
+        Box::pin(async move { Err(TurnError::Permanent(msg)) })
+    }
+}
+
+#[tokio::test]
+async fn bad_delivery_token_and_malformed_recv_do_not_stop_worker() -> TestResult {
+    let rig = start_rig(vec![
+        delivery("bad token spaces", 91, "t-bad-tok", "poison"),
+        delivery("", 92, "t-empty-tok", "poison-empty"),
+        delivery("tok-after-poison", 93, "t-good", "recover"),
+    ])
+    .await?;
+    rig.stub
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .recv_raw
+        .push_back((StatusCode::OK, "not-valid-json".to_owned()));
+    let mut worker = PoolWorker::new(rig.cfg.clone(), rig.client.clone(), &rig.runner);
+    assert_eq!(worker.step().await?, StepOutcome::Idle);
+    assert_eq!(worker.step().await?, StepOutcome::Termed);
+    let _ = worker.step().await?;
+    assert_eq!(worker.step().await?, StepOutcome::Settled);
+    assert_eq!(rig.model.calls(), 1);
+    let g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(g.terms.iter().any(|(tok, _)| tok == "bad token spaces"));
+    assert_eq!(g.acks, vec!["tok-after-poison"]);
+    drop(g);
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_retryable_422_on_send_settles_delivery_and_handles_next() -> TestResult {
+    let rig = start_rig(vec![
+        delivery("tok-422-1", 101, "t-422-1", "first"),
+        delivery("tok-422-2", 102, "t-422-2", "second"),
+    ])
+    .await?;
+    rig.stub
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .send_statuses
+        .extend([StatusCode::UNPROCESSABLE_ENTITY, StatusCode::OK]);
+    let mut worker = PoolWorker::new(rig.cfg.clone(), rig.client.clone(), &rig.runner);
+    assert_eq!(worker.step().await?, StepOutcome::Termed);
+    assert_eq!(worker.step().await?, StepOutcome::Settled);
+    assert_eq!(rig.model.calls(), 2);
+    let g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(g.terms.len(), 1);
+    assert_eq!(g.terms[0].0, "tok-422-1");
+    assert_eq!(g.acks, vec!["tok-422-2"]);
+    drop(g);
+    Ok(())
+}
+
+#[tokio::test]
+async fn permanent_failure_caps_refs_error_on_char_boundary() -> TestResult {
+    let rig = start_rig(vec![delivery("tok-perm-1", 110, "t-perm-1", "fail")]).await?;
+    let long_err = "é".repeat(1_250);
+    let mut worker = PoolWorker::new(
+        rig.cfg.clone(),
+        rig.client.clone(),
+        PermanentFailRunner(long_err),
+    );
+    assert_eq!(worker.step().await?, StepOutcome::Settled);
+    let g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
+    let sent = &g.sends[0]["message"];
+    let refs_err = sent["refs"]["error"].as_str().ok_or("missing refs.error")?;
+    let body: Value = serde_json::from_str(sent["body"].as_str().ok_or("missing body")?)?;
+    let body_err = body["error"].as_str().ok_or("missing body.error")?;
+    assert_eq!(refs_err.chars().count(), 1_024);
+    assert_eq!(refs_err, body_err);
+    drop(g);
+    Ok(())
+}
+
+#[test]
+fn symlink_and_oversize_token_file_are_refused() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let good = write_token_file(dir.path(), 0o600)?;
+    let link = dir.path().join("symlink.token");
+    std::os::unix::fs::symlink(&good, &link)?;
+    assert!(matches!(
+        PoolToken::load(&link),
+        Err(PoolError::TokenFileNotRegular)
+    ));
+
+    let oversize = dir.path().join("oversize.token");
+    let huge = "t".repeat(5_000);
+    std::fs::write(&oversize, format!("{huge}\n"))?;
+    std::fs::set_permissions(&oversize, std::fs::Permissions::from_mode(0o600))?;
+    let err = PoolToken::load(&oversize)
+        .err()
+        .ok_or("expected oversize token file to fail")?;
+    assert!(!err.to_string().contains(&huge));
+    let out = Command::new(LG)
+        .args(["pool", "--cortex-url", "http://127.0.0.1:9", "--token-file"])
+        .arg(&oversize)
+        .args(["--peer-id", PEER_ID, "--shell-id", "shell-cli"])
+        .env("LG_LOG", "warn")
+        .output()?;
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(&huge));
+    Ok(())
+}
+
+#[test]
+fn malformed_or_missing_peer_id_is_refused_at_startup() -> TestResult {
+    assert!(PoolPeerId::new("not-a-uuid").is_err());
+    assert!(PoolPeerId::new("11111111_1111_1111_1111_111111111111").is_err());
+    assert!(PoolPeerId::new("11111111-1111-1111-1111-11111111111g").is_err());
+    assert!(PoolPeerId::new(PEER_ID).is_ok());
+
+    let dir = tempfile::tempdir()?;
+    let tok = write_token_file(dir.path(), 0o600)?;
+    let missing = Command::new(LG)
+        .args(["pool", "--cortex-url", "http://127.0.0.1:9", "--token-file"])
+        .arg(&tok)
+        .args(["--shell-id", "shell-cli"])
+        .env("LG_LOG", "warn")
+        .output()?;
+    assert!(!missing.status.success());
+
+    let bad = Command::new(LG)
+        .args(["pool", "--cortex-url", "http://127.0.0.1:9", "--token-file"])
+        .arg(&tok)
+        .args(["--peer-id", "not-a-uuid", "--shell-id", "shell-cli"])
+        .env("LG_LOG", "warn")
+        .output()?;
+    assert!(!bad.status.success());
     Ok(())
 }
