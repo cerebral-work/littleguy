@@ -5,8 +5,12 @@
 //! newline trimming, and redacts secret bytes from `Debug` and error formatting.
 
 use std::fmt;
+use std::io::{self, Read as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
+use rustix::fs::{Mode, OFlags, open};
+use rustix::io::Errno;
 use thiserror::Error;
 
 /// Maximum size in bytes of a secret file read (`REQ-LG-CONT-01`).
@@ -74,8 +78,53 @@ impl SecretFile {
     /// Returns [`SecretFileError`] when `path` fails `O_NOFOLLOW` open, file-type, mode,
     /// owner, size, or graphic-ASCII checks.
     pub fn load_for_uid(path: &Path, expected_uid: u32) -> Result<Self, SecretFileError> {
-        let _ = (path.exists(), expected_uid);
-        Err(SecretFileError::Invalid)
+        let stat_err = |err: io::Error| SecretFileError::Stat(err.kind().to_string());
+        let fd = match open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::LOOP | Errno::ISDIR) => return Err(SecretFileError::NotRegular),
+            Err(err) => return Err(stat_err(io::Error::from(err))),
+        };
+        let file = std::fs::File::from(fd);
+        let meta = file.metadata().map_err(stat_err)?;
+        if !meta.file_type().is_file() {
+            return Err(SecretFileError::NotRegular);
+        }
+        let mode = meta.mode() & 0o7777;
+        if mode != 0o600 {
+            return Err(SecretFileError::Permissions { mode });
+        }
+        if meta.uid() != expected_uid {
+            return Err(SecretFileError::Owner {
+                owner_uid: meta.uid(),
+                expected_uid,
+            });
+        }
+        let max_u64 = u64::try_from(MAX_SECRET_FILE_BYTES).unwrap_or(u64::MAX - 1);
+        if meta.len() > max_u64 {
+            return Err(SecretFileError::TooLarge {
+                max_bytes: MAX_SECRET_FILE_BYTES,
+            });
+        }
+        let mut buf = Vec::with_capacity(256);
+        (&file)
+            .take(max_u64.saturating_add(1))
+            .read_to_end(&mut buf)
+            .map_err(stat_err)?;
+        if buf.len() > MAX_SECRET_FILE_BYTES {
+            return Err(SecretFileError::TooLarge {
+                max_bytes: MAX_SECRET_FILE_BYTES,
+            });
+        }
+        let raw = std::str::from_utf8(&buf).map_err(|_| SecretFileError::Invalid)?;
+        let trimmed = raw.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(SecretFileError::Invalid);
+        }
+        Ok(Self(trimmed.to_owned()))
     }
 
     /// Borrows the loaded secret string.

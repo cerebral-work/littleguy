@@ -34,6 +34,8 @@ jobs:
         run: cargo xtask fmt
       - name: Clippy, pedantic and nursery, warnings denied
         run: cargo xtask clippy
+      - name: Check container and workflow supply-chain invariants
+        run: cargo xtask container-check
 
   test:
     name: Tests
@@ -78,3 +80,20 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Verify the Verus proofs
         run: cargo xtask verus
+
+  container:
+    name: Container smoke (non-root 65532:65532)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build non-root runtime image
+        run: docker build -t littleguy:ci .
+      - name: Verify non-root user and read-only runtime execution
+        run: |
+          set -euo pipefail
+          test "$(docker inspect -f '{{.Config.User}}' littleguy:ci)" = "65532:65532"
+          test "$(docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges --entrypoint /usr/bin/id littleguy:ci -u)" = "65532"
+          test "$(docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges --entrypoint /usr/bin/id littleguy:ci -g)" = "65532"
+          docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges littleguy:ci --version
+          docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges littleguy:ci pool --help >/dev/null

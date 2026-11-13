@@ -3,8 +3,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::io::{self, Read as _};
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,11 +19,11 @@ use littleguy_stores::{
     AdapterError, HttpMethod, HttpTransport, ReqwestHttpTransport, StoreHttpRequest,
     StoreHttpResponse, join_url_segments, parse_clean_base_url, sha256_hex,
 };
-use rustix::fs::{Mode, OFlags, open};
-use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+
+use crate::secret_file::{SecretFile, SecretFileError};
 
 /// Default allowed sender role on Cortex (`escapement-serve` pool publisher).
 pub const DEFAULT_ALLOWED_SENDER: &str = "service-escapement-pool";
@@ -156,53 +154,24 @@ impl PoolToken {
     /// Returns [`PoolError`] when `path` fails `O_NOFOLLOW` open, file-type, mode, owner, size,
     /// or token-byte checks.
     pub fn load_for_uid(path: &Path, expected_uid: u32) -> Result<Self, PoolError> {
-        let stat_err = |e: io::Error| PoolError::TokenFileStat(e.kind().to_string());
-        let fd = match open(
-            path,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(Errno::LOOP | Errno::ISDIR) => return Err(PoolError::TokenFileNotRegular),
-            Err(err) => return Err(stat_err(io::Error::from(err))),
-        };
-        let file = std::fs::File::from(fd);
-        let meta = file.metadata().map_err(stat_err)?;
-        if !meta.file_type().is_file() {
-            return Err(PoolError::TokenFileNotRegular);
-        }
-        let mode = meta.mode() & 0o7777;
-        if mode != 0o600 {
-            return Err(PoolError::TokenFilePermissions { mode });
-        }
-        if meta.uid() != expected_uid {
-            return Err(PoolError::TokenFileOwner {
-                owner_uid: meta.uid(),
-                expected_uid,
-            });
-        }
-        let max_u64 = u64::try_from(MAX_TOKEN_FILE_BYTES).unwrap_or(u64::MAX - 1);
-        if meta.len() > max_u64 {
-            return Err(PoolError::TokenFileTooLarge {
-                max_bytes: MAX_TOKEN_FILE_BYTES,
-            });
-        }
-        let mut buf = Vec::with_capacity(256);
-        (&file)
-            .take(max_u64.saturating_add(1))
-            .read_to_end(&mut buf)
-            .map_err(stat_err)?;
-        if buf.len() > MAX_TOKEN_FILE_BYTES {
-            return Err(PoolError::TokenFileTooLarge {
-                max_bytes: MAX_TOKEN_FILE_BYTES,
-            });
-        }
-        let raw = std::str::from_utf8(&buf).map_err(|_| PoolError::TokenInvalid)?;
-        let trimmed = raw.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(PoolError::TokenInvalid);
-        }
-        Ok(Self(trimmed.to_owned()))
+        SecretFile::load_for_uid(path, expected_uid)
+            .map(|secret| Self(secret.expose_secret().to_owned()))
+            .map_err(|err| match err {
+                SecretFileError::Stat(msg) => PoolError::TokenFileStat(msg),
+                SecretFileError::NotRegular => PoolError::TokenFileNotRegular,
+                SecretFileError::Permissions { mode } => PoolError::TokenFilePermissions { mode },
+                SecretFileError::Owner {
+                    owner_uid,
+                    expected_uid,
+                } => PoolError::TokenFileOwner {
+                    owner_uid,
+                    expected_uid,
+                },
+                SecretFileError::TooLarge { max_bytes } => {
+                    PoolError::TokenFileTooLarge { max_bytes }
+                }
+                SecretFileError::Invalid => PoolError::TokenInvalid,
+            })
     }
 }
 

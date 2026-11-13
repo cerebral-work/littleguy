@@ -1,0 +1,14 @@
+# Exclude VCS metadata, build artifacts, docs, and `rust-toolchain.toml`
+# (the pinned `rust:1.99.1-slim-trixie` builder image already provides 1.99.1).
+.git
+.github
+target
+debug
+rust-toolchain.toml
+specs
+docs
+formal
+**/mutants.out*/
+rustc-ice-*.txt
+*.pdb
+**/*.rs.bk

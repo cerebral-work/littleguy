@@ -1,0 +1,212 @@
+# Builds, scans, pushes, signs, and attests `harbor.unsigned.gg/platform/littleguy`
+# (`specs/0006`, `REQ-LG-CONT-03`).
+#
+# Required repository secrets (operator-gated; while any secret is absent, the
+# `preflight` job emits `ready=false` and `publish` skips cleanly without
+# creating GitHub Environments or failing CI):
+#   - HARBOR_PLATFORM_PUSH_USERNAME
+#   - HARBOR_PLATFORM_PUSH_PASSWORD
+#   - COSIGN_PRIVATE_KEY
+#   - COSIGN_PASSWORD
+# Optional repository secret:
+#   - KYVERNO_COSIGN_PUBLIC_KEY (when set, verifies signature and attestation
+#     against the cluster admission public key in addition to the key's own
+#     derived public key)
+name: build-image
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-image-main
+  cancel-in-progress: false
+
+env:
+  HARBOR_REGISTRY: harbor.unsigned.gg
+  IMAGE_REPO: harbor.unsigned.gg/platform/littleguy
+
+jobs:
+  preflight:
+    name: Check Harbor and Cosign secret readiness
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.secrets.outputs.ready }}
+      sha: ${{ steps.secrets.outputs.sha }}
+    steps:
+      - name: Check branch and repository secrets
+        id: secrets
+        env:
+          HAS_HARBOR_USER: ${{ secrets.HARBOR_PLATFORM_PUSH_USERNAME != '' }}
+          HAS_HARBOR_PASS: ${{ secrets.HARBOR_PLATFORM_PUSH_PASSWORD != '' }}
+          HAS_COSIGN_KEY: ${{ secrets.COSIGN_PRIVATE_KEY != '' }}
+          HAS_COSIGN_PASS: ${{ secrets.COSIGN_PASSWORD != '' }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "workflow_run" ]; then
+            [ "$WORKFLOW_RUN_BRANCH" = "main" ] || { echo "::error::workflow_run branch '$WORKFLOW_RUN_BRANCH' is not main"; exit 1; }
+            target_sha="$WORKFLOW_RUN_SHA"
+          else
+            [ "$GITHUB_REF" = "refs/heads/main" ] || { echo "::error::workflow_dispatch must run on refs/heads/main"; exit 1; }
+            target_sha="$GITHUB_SHA"
+          fi
+          [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid target commit sha '$target_sha'"; exit 1; }
+          echo "sha=$target_sha" >> "$GITHUB_OUTPUT"
+
+          missing=""
+          [ "$HAS_HARBOR_USER" = "true" ] || missing="$missing HARBOR_PLATFORM_PUSH_USERNAME"
+          [ "$HAS_HARBOR_PASS" = "true" ] || missing="$missing HARBOR_PLATFORM_PUSH_PASSWORD"
+          [ "$HAS_COSIGN_KEY" = "true" ] || missing="$missing COSIGN_PRIVATE_KEY"
+          [ "$HAS_COSIGN_PASS" = "true" ] || missing="$missing COSIGN_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::notice::Skipping Harbor publish for $target_sha; unseeded repository secrets:$missing"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    name: Build, scan, push, sign, and attest image
+    needs: preflight
+    if: needs.preflight.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      digest: ${{ steps.sign.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install SHA-256 pinned crane, cosign, trivy, and syft
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
+          inst() {
+            curl -sSfL --retry 3 -o "$RUNNER_TEMP/$1.dl" "$2"
+            echo "$3  $RUNNER_TEMP/$1.dl" | sha256sum -c -
+            if [ -n "${4:-}" ]; then
+              tar -xzf "$RUNNER_TEMP/$1.dl" -C "$RUNNER_TEMP" "$4"
+              mv "$RUNNER_TEMP/$4" "$bin/$1"
+            else
+              mv "$RUNNER_TEMP/$1.dl" "$bin/$1"
+            fi
+            chmod +x "$bin/$1"
+          }
+          inst crane https://github.com/google/go-containerregistry/releases/download/v0.21.7/go-containerregistry_Linux_x86_64.tar.gz 1a57bc98207fa1c0d04bf760699099e26f8383499bfd55b99c1b919a928a7230 crane
+          inst cosign https://github.com/sigstore/cosign/releases/download/v2.6.1/cosign-linux-amd64 064954c5d8c7e3b28188eee5b1727b31c411550bc5fefd41aa672d3c761d103a
+          inst trivy https://github.com/aquasecurity/trivy/releases/download/v0.70.0/trivy_0.70.0_Linux-64bit.tar.gz 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9 trivy
+          inst syft https://github.com/anchore/syft/releases/download/v1.55.0/syft_1.55.0_linux_amd64.tar.gz bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d syft
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Preflight Harbor robot scope and log in
+        env:
+          PUSH_USER: ${{ secrets.HARBOR_PLATFORM_PUSH_USERNAME }}
+          PUSH_PASS: ${{ secrets.HARBOR_PLATFORM_PUSH_PASSWORD }}
+          TARGET_SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          set -euo pipefail
+          ver=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          [ -n "$ver" ] || { echo "::error::no workspace version in Cargo.toml"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -u "$PUSH_USER:$PUSH_PASS" \
+            "https://$HARBOR_REGISTRY/v2/platform/littleguy/tags/list")
+          case "$code" in
+            401|403)
+              echo "::error::HARBOR_PLATFORM_PUSH_USERNAME cannot access platform/littleguy (HTTP $code)"
+              exit 1 ;;
+          esac
+          dc="$RUNNER_TEMP/docker"; mkdir -p "$dc"
+          printf '%s' "$PUSH_PASS" | DOCKER_CONFIG="$dc" docker login "$HARBOR_REGISTRY" -u "$PUSH_USER" --password-stdin
+          {
+            echo "SHORT=${TARGET_SHA:0:12}"
+            echo "SHORT7=${TARGET_SHA:0:7}"
+            echo "VER=$ver"
+            echo "LOCAL_TAG=littleguy:local-${TARGET_SHA:0:12}"
+            echo "DOCKER_CONFIG=$dc"
+          } >> "$GITHUB_ENV"
+
+      - name: Build, smoke-check non-root runtime, and scan with Trivy before push
+        env:
+          TARGET_SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --label "org.opencontainers.image.revision=$TARGET_SHA" \
+            --label "org.opencontainers.image.version=$VER" \
+            -t "$LOCAL_TAG" .
+          test "$(docker inspect -f '{{.Config.User}}' "$LOCAL_TAG")" = "65532:65532"
+          test "$(docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges --entrypoint /usr/bin/id "$LOCAL_TAG" -u)" = "65532"
+          docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges "$LOCAL_TAG" --version
+          {
+            echo "### littleguy git-$SHORT ($VER)"
+            echo '```'
+            trivy image -q --severity HIGH,CRITICAL --exit-code 0 "$LOCAL_TAG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          trivy image -q --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$LOCAL_TAG"
+
+      - name: Push immutable tags, sign digest, and attach CycloneDX SBOM
+        id: sign
+        env:
+          COSIGN_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          KYVERNO_PUB: ${{ secrets.KYVERNO_COSIGN_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/cosign.key"; pub="$RUNNER_TEMP/cosign.pub"; kyverno="$RUNNER_TEMP/kyverno.pub"
+          (umask 077; printf '%s' "$COSIGN_KEY" > "$key")
+          unset COSIGN_KEY
+          cosign public-key --key "$key" > "$pub"
+          if [ -n "$KYVERNO_PUB" ]; then
+            (umask 077; printf '%s' "$KYVERNO_PUB" > "$kyverno")
+          fi
+          unset KYVERNO_PUB
+
+          git_ref="$IMAGE_REPO:git-$SHORT"
+          ver_ref="$IMAGE_REPO:$VER-$SHORT7"
+          if ! crane digest "$git_ref" >/dev/null 2>&1; then
+            docker tag "$LOCAL_TAG" "$git_ref"
+            docker push "$git_ref"
+          fi
+          dig=$(crane digest "$git_ref")
+          [[ "$dig" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::$git_ref returned invalid digest '$dig'"; exit 1; }
+          if ! crane digest "$ver_ref" >/dev/null 2>&1; then
+            crane tag "$IMAGE_REPO@$dig" "$VER-$SHORT7"
+          fi
+          ref="$IMAGE_REPO@$dig"
+
+          cosign sign --key "$key" --tlog-upload=false --yes "$ref"
+          cosign verify --key "$pub" --insecure-ignore-tlog=true "$ref" >/dev/null
+          if [ -f "$kyverno" ]; then
+            cosign verify --key "$kyverno" --insecure-ignore-tlog=true "$ref" >/dev/null
+          fi
+
+          env -u COSIGN_PASSWORD syft scan "registry:$ref" -o "cyclonedx-json@1.5=$RUNNER_TEMP/littleguy.cdx.json"
+          cosign attest --key "$key" --type cyclonedx --predicate "$RUNNER_TEMP/littleguy.cdx.json" --tlog-upload=false --yes "$ref"
+          cosign verify-attestation --key "$pub" --type cyclonedx --insecure-ignore-tlog=true "$ref" >/dev/null
+          if [ -f "$kyverno" ]; then
+            cosign verify-attestation --key "$kyverno" --type cyclonedx --insecure-ignore-tlog=true "$ref" >/dev/null
+          fi
+
+          if ! crane digest "$IMAGE_REPO:v$VER" >/dev/null 2>&1; then
+            crane tag "$ref" "v$VER"
+          fi
+          echo "digest=$dig" >> "$GITHUB_OUTPUT"
+          echo "Signed and attested: \`$ref\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up temporary credentials
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/docker" "$RUNNER_TEMP/cosign.key" "$RUNNER_TEMP/cosign.pub" "$RUNNER_TEMP/kyverno.pub" "$RUNNER_TEMP/littleguy.tar" || true

@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: implemented
 created: 2026-11-13
 tags: [littleguy, container, docker, harbor, pool, secret-file, littleman]
 priority: high
