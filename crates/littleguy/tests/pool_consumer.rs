@@ -33,6 +33,8 @@ struct StubData {
     recv_raw: VecDeque<(StatusCode, String)>,
     recv_fallback_raw: Option<(StatusCode, String)>,
     send_statuses: VecDeque<StatusCode>,
+    ack_statuses: VecDeque<StatusCode>,
+    extend_statuses: VecDeque<StatusCode>,
     term_statuses: VecDeque<StatusCode>,
     recvs: Vec<(Option<String>, Value)>,
     acks: Vec<String>,
@@ -79,13 +81,28 @@ async fn stub_post(
                 g.acks
                     .extend(arr.iter().filter_map(Value::as_str).map(str::to_owned));
             }
-            reply(StatusCode::NO_CONTENT, String::new())
+            let code = g.ack_statuses.pop_front().unwrap_or(StatusCode::NO_CONTENT);
+            let body = if code.is_success() {
+                String::new()
+            } else {
+                json!({ "error": "ack rejected" }).to_string()
+            };
+            reply(code, body)
         }
         "/v1/mesh/pool/extend" => {
             if let Some(tok) = b["delivery_token"].as_str() {
                 g.extends.push(tok.to_owned());
             }
-            reply(StatusCode::NO_CONTENT, String::new())
+            let code = g
+                .extend_statuses
+                .pop_front()
+                .unwrap_or(StatusCode::NO_CONTENT);
+            let body = if code.is_success() {
+                String::new()
+            } else {
+                json!({ "error": "extend rejected" }).to_string()
+            };
+            reply(code, body)
         }
         "/v1/mesh/pool/nack" => {
             let tok = b["delivery_token"].as_str().unwrap_or_default().to_owned();
@@ -714,5 +731,62 @@ fn fifo_and_directory_token_paths_are_refused() -> TestResult {
         PoolToken::load(&fifo),
         Err(PoolError::TokenFileNotRegular)
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ack_extend_and_send_403_do_not_stop_worker() -> TestResult {
+    let rig = start_rig(vec![
+        delivery("tok-send-403", 161, "t-send-403", "send-rejected"),
+        delivery("tok-ack-403", 162, "t-ack-403", "ack-rejected"),
+        delivery("tok-after-403s", 163, "t-after-403s", "survives"),
+    ])
+    .await?;
+    {
+        let mut g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
+        g.send_statuses
+            .extend([StatusCode::FORBIDDEN, StatusCode::OK, StatusCode::OK]);
+        g.ack_statuses
+            .extend([StatusCode::FORBIDDEN, StatusCode::NO_CONTENT]);
+        g.extend_statuses.push_back(StatusCode::FORBIDDEN);
+    }
+    let mut worker = PoolWorker::new(
+        rig.cfg.clone(),
+        rig.client.clone(),
+        SlowRunner(&rig.runner, Duration::from_millis(60)),
+    );
+    assert_eq!(worker.step().await?, StepOutcome::Termed);
+    assert_eq!(worker.step().await?, StepOutcome::Settled);
+    assert_eq!(worker.step().await?, StepOutcome::Settled);
+    assert_eq!(rig.model.calls(), 3);
+    let g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(g.terms.len(), 1);
+    assert_eq!(g.terms[0].0, "tok-send-403");
+    assert!(g.terms[0].1.contains("403"));
+    assert!(g.extends.iter().any(|t| t == "tok-send-403"));
+    assert_eq!(g.acks, vec!["tok-ack-403", "tok-after-403s"]);
+    drop(g);
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_recv_with_zero_wait_ms_does_not_spin() -> TestResult {
+    let mut rig = start_rig(Vec::new()).await?;
+    rig.cfg.wait_ms = 0;
+    let mut worker = PoolWorker::new(rig.cfg.clone(), rig.client.clone(), &rig.runner);
+    worker
+        .run_until(tokio::time::sleep(Duration::from_millis(180)))
+        .await?;
+    let recvs_len = rig
+        .stub
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .recvs
+        .len();
+    assert!(
+        (1..=2).contains(&recvs_len),
+        "expected idle floor to bound recv calls to 1..=2, got {recvs_len}"
+    );
     Ok(())
 }
