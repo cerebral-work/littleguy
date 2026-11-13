@@ -33,6 +33,8 @@ pub const DEFAULT_ALLOWED_SENDER: &str = "service-escapement-pool";
 pub const DEFAULT_MEMBER_ROLE: &str = "service-pool-littleman-1";
 /// Default long-poll wait in milliseconds for `/v1/mesh/pool/recv`.
 pub const DEFAULT_WAIT_MS: u32 = 5_000;
+/// Minimum elapsed duration per empty (`Idle`) `recv` cycle in [`PoolWorker::run_until`].
+pub const MIN_IDLE_POLL_FLOOR: Duration = Duration::from_millis(250);
 /// Default redelivery delay in milliseconds for `/v1/mesh/pool/nack`.
 pub const DEFAULT_NACK_DELAY_MS: u32 = 5_000;
 /// Maximum size in bytes of the `--token-file` read (`REQ-LG-POOL-01`).
@@ -715,12 +717,12 @@ impl<R: TurnRunner> PoolWorker<R> {
 
     /// Polls Cortex once (`free_slots: 1`) and processes any returned delivery.
     ///
-    /// Per-delivery poison tokens, malformed payloads, and non-auth HTTP errors are
-    /// logged and settled (or skipped so the lease expires) without stopping the worker.
+    /// Per-delivery poison tokens, malformed payloads, and settle or send HTTP errors
+    /// are logged and settled (or skipped so the lease expires) without failing `step`.
     ///
     /// # Errors
     ///
-    /// Returns [`PoolError`] when `/v1/mesh/pool/recv` fails or Cortex returns `401`/`403`.
+    /// Returns [`PoolError`] only when `/v1/mesh/pool/recv` fails.
     pub async fn step(&mut self) -> Result<StepOutcome, PoolError> {
         let batch = self
             .client
@@ -790,19 +792,29 @@ impl<R: TurnRunner> PoolWorker<R> {
     ) -> Result<(), PoolError> {
         tokio::pin!(stop);
         loop {
+            let started = tokio::time::Instant::now();
             tokio::select! {
                 () = &mut stop => return Ok(()),
-                res = self.step() => if let Err(err) = res {
-                    if err.is_recv_fatal() {
-                        return Err(err);
+                res = self.step() => match res {
+                    Ok(StepOutcome::Idle) => {
+                        if let Some(rem) = MIN_IDLE_POLL_FLOOR.checked_sub(started.elapsed()) {
+                            tokio::select! {
+                                () = &mut stop => return Ok(()),
+                                () = tokio::time::sleep(rem) => {}
+                            }
+                        }
                     }
-                    tracing::warn!(
-                        reason = %truncate_chars(&err.to_string(), 256),
-                        "pool poll error; backing off"
-                    );
-                    tokio::select! {
-                        () = &mut stop => return Ok(()),
-                        () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    Ok(_) => {}
+                    Err(err) if err.is_recv_fatal() => return Err(err),
+                    Err(err) => {
+                        tracing::warn!(
+                            reason = %truncate_chars(&err.to_string(), 256),
+                            "pool poll error; backing off"
+                        );
+                        tokio::select! {
+                            () = &mut stop => return Ok(()),
+                            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        }
                     }
                 }
             }
