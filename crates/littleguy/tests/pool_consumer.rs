@@ -31,7 +31,9 @@ const PEER_ID: &str = "11111111-1111-1111-1111-111111111111";
 struct StubData {
     deliveries: VecDeque<Value>,
     recv_raw: VecDeque<(StatusCode, String)>,
+    recv_fallback_raw: Option<(StatusCode, String)>,
     send_statuses: VecDeque<StatusCode>,
+    term_statuses: VecDeque<StatusCode>,
     recvs: Vec<(Option<String>, Value)>,
     acks: Vec<String>,
     extends: Vec<String>,
@@ -64,9 +66,12 @@ async fn stub_post(
             g.recvs.push((uri.query().map(str::to_owned), b));
             if let Some((code, raw)) = g.recv_raw.pop_front() {
                 reply(code, raw)
+            } else if let Some(item) = g.deliveries.pop_front() {
+                reply(StatusCode::OK, Value::Array(vec![item]).to_string())
+            } else if let Some((code, raw)) = g.recv_fallback_raw.clone() {
+                reply(code, raw)
             } else {
-                let items: Vec<Value> = g.deliveries.pop_front().into_iter().collect();
-                reply(StatusCode::OK, Value::Array(items).to_string())
+                reply(StatusCode::OK, "[]".to_owned())
             }
         }
         "/v1/mesh/pool/ack" => {
@@ -92,7 +97,16 @@ async fn stub_post(
             let tok = b["delivery_token"].as_str().unwrap_or_default().to_owned();
             let why = b["reason"].as_str().unwrap_or_default().to_owned();
             g.terms.push((tok, why));
-            reply(StatusCode::NO_CONTENT, String::new())
+            let code = g
+                .term_statuses
+                .pop_front()
+                .unwrap_or(StatusCode::NO_CONTENT);
+            let body = if code.is_success() {
+                String::new()
+            } else {
+                json!({ "error": "term rejected" }).to_string()
+            };
+            reply(code, body)
         }
         "/v1/mesh/send" => {
             g.sends.push(b);
@@ -442,9 +456,9 @@ async fn bad_delivery_token_and_malformed_recv_do_not_stop_worker() -> TestResul
         .recv_raw
         .push_back((StatusCode::OK, "not-valid-json".to_owned()));
     let mut worker = PoolWorker::new(rig.cfg.clone(), rig.client.clone(), &rig.runner);
-    assert_eq!(worker.step().await?, StepOutcome::Idle);
+    assert!(matches!(worker.step().await, Err(PoolError::Decode(_))));
     assert_eq!(worker.step().await?, StepOutcome::Termed);
-    let _ = worker.step().await?;
+    assert_eq!(worker.step().await?, StepOutcome::Idle);
     assert_eq!(worker.step().await?, StepOutcome::Settled);
     assert_eq!(rig.model.calls(), 1);
     let g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -474,6 +488,11 @@ async fn non_retryable_422_on_send_settles_delivery_and_handles_next() -> TestRe
     let g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
     assert_eq!(g.terms.len(), 1);
     assert_eq!(g.terms[0].0, "tok-422-1");
+    assert!(
+        g.terms[0].1.contains("send rejected") && g.terms[0].1.contains("422"),
+        "unexpected term reason: {}",
+        g.terms[0].1
+    );
     assert_eq!(g.acks, vec!["tok-422-2"]);
     drop(g);
     Ok(())
@@ -554,5 +573,146 @@ fn malformed_or_missing_peer_id_is_refused_at_startup() -> TestResult {
         .env("LG_LOG", "warn")
         .output()?;
     assert!(!bad.status.success());
+    Ok(())
+}
+
+#[tokio::test]
+async fn term_403_on_poison_token_does_not_stop_worker() -> TestResult {
+    let rig = start_rig(vec![
+        delivery("bad token 403", 131, "t-poison-403", "poison"),
+        delivery("tok-after-403", 132, "t-good-403", "recover-after-403"),
+    ])
+    .await?;
+    rig.stub
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .term_statuses
+        .push_back(StatusCode::FORBIDDEN);
+    let mut worker = PoolWorker::new(rig.cfg.clone(), rig.client.clone(), &rig.runner);
+    assert_eq!(worker.step().await?, StepOutcome::Termed);
+    assert_eq!(worker.step().await?, StepOutcome::Settled);
+    assert_eq!(rig.model.calls(), 1);
+    let g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(g.terms.len(), 1);
+    assert_eq!(g.terms[0].0, "bad token 403");
+    assert_eq!(g.acks, vec!["tok-after-403"]);
+    drop(g);
+    Ok(())
+}
+
+#[tokio::test]
+async fn term_failure_after_422_send_keeps_cached_reply_for_redelivery() -> TestResult {
+    let mut redelivered = delivery("tok-422-keep-2", 142, "t-422-keep", "compute-once");
+    redelivered["delivery_attempt"] = json!(2);
+    let rig = start_rig(vec![
+        delivery("tok-422-keep-1", 141, "t-422-keep", "compute-once"),
+        redelivered,
+    ])
+    .await?;
+    {
+        let mut g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
+        g.send_statuses
+            .extend([StatusCode::UNPROCESSABLE_ENTITY, StatusCode::OK]);
+        g.term_statuses.push_back(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let mut worker = PoolWorker::new(rig.cfg.clone(), rig.client.clone(), &rig.runner);
+    assert_eq!(worker.step().await?, StepOutcome::Termed);
+    assert_eq!(worker.step().await?, StepOutcome::ReplayedFromCache);
+    assert_eq!(rig.model.calls(), 1);
+    let g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(g.terms.len(), 1);
+    assert_eq!(g.terms[0].0, "tok-422-keep-1");
+    assert_eq!(g.acks, vec!["tok-422-keep-2"]);
+    assert_eq!(g.sends.len(), 2);
+    drop(g);
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_array_recv_body_returns_decode_error_and_backs_off() -> TestResult {
+    let rig = start_rig(Vec::new()).await?;
+    rig.stub
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .recv_fallback_raw = Some((StatusCode::OK, "{}".to_owned()));
+    let mut worker = PoolWorker::new(rig.cfg.clone(), rig.client.clone(), &rig.runner);
+    assert!(matches!(worker.step().await, Err(PoolError::Decode(_))));
+    rig.stub
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .recvs
+        .clear();
+    worker
+        .run_until(tokio::time::sleep(Duration::from_millis(180)))
+        .await?;
+    let recvs_len = rig
+        .stub
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .recvs
+        .len();
+    assert!(
+        (1..=2).contains(&recvs_len),
+        "expected backoff to bound recv calls to 1..=2, got {recvs_len}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retryable_5xx_on_send_nacks_and_replays_cached_reply() -> TestResult {
+    let mut redelivered = delivery("tok-503-2", 152, "t-503", "compute-once");
+    redelivered["delivery_attempt"] = json!(2);
+    let rig = start_rig(vec![
+        delivery("tok-503-1", 151, "t-503", "compute-once"),
+        redelivered,
+    ])
+    .await?;
+    rig.stub
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .send_statuses
+        .extend([StatusCode::SERVICE_UNAVAILABLE, StatusCode::OK]);
+    let mut worker = PoolWorker::new(rig.cfg.clone(), rig.client.clone(), &rig.runner);
+    assert_eq!(worker.step().await?, StepOutcome::Nacked);
+    assert_eq!(worker.step().await?, StepOutcome::ReplayedFromCache);
+    assert_eq!(rig.model.calls(), 1);
+    let g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(g.nacks, vec![("tok-503-1".to_owned(), 2_500)]);
+    assert_eq!(g.acks, vec!["tok-503-2"]);
+    assert_eq!(g.sends.len(), 2);
+    assert_eq!(g.sends[1]["message"]["refs"]["stream_seq"], json!(152));
+    drop(g);
+    Ok(())
+}
+
+#[test]
+fn fifo_and_directory_token_paths_are_refused() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let subdir = dir.path().join("token.dir");
+    std::fs::create_dir(&subdir)?;
+    std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o600))?;
+    assert!(matches!(
+        PoolToken::load(&subdir),
+        Err(PoolError::TokenFileNotRegular)
+    ));
+    std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o700))?;
+
+    let fifo = dir.path().join("token.fifo");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )?;
+    assert!(matches!(
+        PoolToken::load(&fifo),
+        Err(PoolError::TokenFileNotRegular)
+    ));
     Ok(())
 }
