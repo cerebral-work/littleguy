@@ -1,5 +1,5 @@
 ---
-status: draft
+status: implemented
 created: 2026-11-13
 tags: [littleguy, pool, cortex, escapement, ghost, littleman]
 priority: high
@@ -63,11 +63,11 @@ Inbound reply fields and `refs` keys that `escapement-serve` parses:
 ## 4. Requirements (EARS)
 
 - **REQ-LG-POOL-01:** When `lg pool` starts, the loader shall check `--token-file` with `symlink_metadata` and shall refuse to start if the path is not a regular file, has mode other than `0600`, or is not owned by the current user, without printing the token in `Debug`, logs, or errors.
-  Proof: tests `token_file_mode_other_than_0600_or_wrong_owner_refuses_to_start`, `pool_token_debug_and_errors_redact_secret`.
+  Proof: test `token_file_mode_other_than_0600_or_wrong_owner_refuses_to_start_and_redacts`.
 - **REQ-LG-POOL-02:** When a delivery arrives from `POST /v1/mesh/pool/recv` (`free_slots: 1`) with `from_session` different from `--allowed-sender` or with a field over its section 3 bound, the worker shall call `POST /v1/mesh/pool/term` with a reason and shall not run a turn.
-  Proof: tests `wrong_sender_is_refused_with_term_and_runs_no_turn`, `oversized_delivery_is_refused_with_term_and_runs_no_turn`.
+  Proof: tests `wrong_sender_is_refused_with_term_and_runs_no_turn`, `malformed_ghost_binding_and_oversized_body_are_termed_without_turn`.
 - **REQ-LG-POOL-03:** Where a delivery carries a non-null `ghost_binding`, the worker shall validate it with `littleguy_core::ghost_binding::GhostBinding` and, if invalid, shall call `POST /v1/mesh/pool/term` with a reason and shall not run a turn.
-  Proof: test `malformed_ghost_binding_is_refused_with_term_and_runs_no_turn`.
+  Proof: test `malformed_ghost_binding_and_oversized_body_are_termed_without_turn`.
 - **REQ-LG-POOL-04:** Where a delivery carries `"ghost_binding": null`, the worker shall treat `ghost_binding` as absent, matching a missing key.
   Proof: test `null_ghost_binding_is_treated_as_absent_and_runs_unbound_turn`.
 - **REQ-LG-POOL-05:** While a valid turn runs behind `TurnRunner` (`RuntimeTurnRunner` on `LittleguySeatSubstrate` and single-writer `SqliteRuntime`), the worker shall extend the lease via `POST /v1/mesh/pool/extend`.

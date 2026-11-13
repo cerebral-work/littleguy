@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Littleman Pool Consumer (`littleguy`, `littleguy-core`, `specs/0005`):**
+  - Added `lg pool` (`--cortex-url`, `--token-file`, `--allowed-sender`, `--wait-ms`, `--shell-id`) with `0600` regular-file user-owned `PoolToken` loading and redacted `Debug` and error formatting.
+  - Added `PoolClient`, `PoolWorker`, `TurnRunner`, and `RuntimeTurnRunner` (`LittleguySeatSubstrate` plus single-writer `SqliteRuntime`), enforcing sender and payload caps (`12 KiB` body, `16 KiB` `refs`, `8 KiB` reply), `GhostBinding` validation with `"ghost_binding": null` absent parity, background lease `extend`, bounded `(TaskId, attempt)` replay cache, and `escapement-serve` reply settlement (`ack`, `nack`, `term`).
+  - Added boundary id newtypes `TaskId`, `ShellId`, `RoleName`, `PoolPeerId`, and `DeliveryToken` in `littleguy-core::ids`.
 - **GhostBinding Validator (`littleguy-core`, `specs/0004`):**
   - Added the zero-I/O `GhostBinding` type, `GhostBindingWire`, `GhostManifestation`, `GhostLifecycleState` and `validate`, which refuses a binding with a typed `GhostBindingError`. Deserializing a `GhostBinding` runs the validator and refuses unknown fields.
   - Enforced the cortex REQ-0125-03/-04 rules: a persistent manifestation needs a `spiffe://unsigned.gg/agent/TEAM/SLUG` seat, and `Crew` holds no seat and never enters `dormant` or `dreaming`.
