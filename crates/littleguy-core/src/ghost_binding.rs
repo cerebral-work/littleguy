@@ -172,8 +172,8 @@ pub struct GhostBindingWire {
     /// The molt counter.
     pub molt_epoch: u64,
     /// The lifecycle state, when the delivery states it.
-    #[serde(default)]
-    pub lifecycle_state: Option<GhostLifecycleState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<GhostLifecycleState>,
 }
 
 /// A validated Ghost callsign: 1 to 64 bytes of `[a-z0-9-]`.
@@ -209,7 +209,7 @@ pub struct GhostBinding {
     mitc_principal: String,
     spiffe_seat: Option<GhostSeat>,
     molt_epoch: u64,
-    lifecycle_state: Option<GhostLifecycleState>,
+    state: Option<GhostLifecycleState>,
 }
 
 impl GhostBinding {
@@ -245,8 +245,8 @@ impl GhostBinding {
 
     /// The stated lifecycle state, if any.
     #[must_use]
-    pub const fn lifecycle_state(&self) -> Option<GhostLifecycleState> {
-        self.lifecycle_state
+    pub const fn state(&self) -> Option<GhostLifecycleState> {
+        self.state
     }
 }
 
@@ -258,7 +258,7 @@ impl From<GhostBinding> for GhostBindingWire {
             mitc_principal: binding.mitc_principal,
             spiffe_seat: binding.spiffe_seat.map(|seat| seat.0),
             molt_epoch: binding.molt_epoch,
-            lifecycle_state: binding.lifecycle_state,
+            state: binding.state,
         }
     }
 }
@@ -299,7 +299,7 @@ pub fn validate(wire: GhostBindingWire) -> Result<GhostBinding, GhostBindingErro
             return Err(GhostBindingError::CrewHoldsSeat);
         }
         if let Some(state @ (GhostLifecycleState::Dormant | GhostLifecycleState::Dreaming)) =
-            wire.lifecycle_state
+            wire.state
         {
             return Err(GhostBindingError::CrewForbiddenState { state });
         }
@@ -319,7 +319,7 @@ pub fn validate(wire: GhostBindingWire) -> Result<GhostBinding, GhostBindingErro
         mitc_principal: wire.mitc_principal,
         spiffe_seat: seat,
         molt_epoch: wire.molt_epoch,
-        lifecycle_state: wire.lifecycle_state,
+        state: wire.state,
     })
 }
 
@@ -381,7 +381,7 @@ mod tests {
             mitc_principal: "ctodie".to_owned(),
             spiffe_seat: seat,
             molt_epoch: 3,
-            lifecycle_state: None,
+            state: None,
         }
     }
 
@@ -393,8 +393,9 @@ mod tests {
     // `GhostManifestation` (:29, `snake_case`), `GhostLifecycleState` (:101,
     // `snake_case`), `GhostLifecycleRecord` (:428: `ghost_id`, `manifestation`,
     // `mitc_principal`, `spiffe_seat`, `molt_epoch`) and
-    // `GHOST_SPIFFE_AGENT_PREFIX` (:21). Cortex names the state field `state`.
-    // littleguy names it `lifecycle_state` and makes it optional (spec 0004).
+    // `GHOST_SPIFFE_AGENT_PREFIX` (:21). The `state` field is optional here and
+    // omitted when `None` (spec 0004). This test pins littleguy's side only. It
+    // cannot detect cortex drift, because there is no cortex dependency.
     #[test]
     fn serialized_shape_matches_cortex_contract() {
         let json =
@@ -405,9 +406,12 @@ mod tests {
             "mitc_principal": "ctodie",
             "spiffe_seat": "spiffe://unsigned.gg/agent/platform/sadr",
             "molt_epoch": 3,
-            "lifecycle_state": null,
         });
         assert_eq!(json, expected);
+        let mut with_state = wire(GhostManifestation::Agent);
+        with_state.state = Some(GhostLifecycleState::Awake);
+        let json = serde_json::to_value(validate(with_state).unwrap()).unwrap();
+        assert_eq!(json["state"], serde_json::json!("awake"));
         assert_eq!(GHOST_SPIFFE_AGENT_PREFIX, "spiffe://unsigned.gg/agent/");
         for (m, s) in [
             (GhostManifestation::Persona, "persona"),
@@ -446,7 +450,7 @@ mod tests {
     #[test]
     fn crew_in_dormant_is_refused() {
         let mut w = wire(GhostManifestation::Crew);
-        w.lifecycle_state = Some(GhostLifecycleState::Dormant);
+        w.state = Some(GhostLifecycleState::Dormant);
         assert_eq!(
             err(w),
             GhostBindingError::CrewForbiddenState {
@@ -458,7 +462,7 @@ mod tests {
     #[test]
     fn crew_in_dreaming_is_refused() {
         let mut w = wire(GhostManifestation::Crew);
-        w.lifecycle_state = Some(GhostLifecycleState::Dreaming);
+        w.state = Some(GhostLifecycleState::Dreaming);
         assert_eq!(
             err(w),
             GhostBindingError::CrewForbiddenState {
@@ -470,7 +474,7 @@ mod tests {
     #[test]
     fn crew_without_seat_is_accepted() {
         let mut w = wire(GhostManifestation::Crew);
-        w.lifecycle_state = Some(GhostLifecycleState::Awake);
+        w.state = Some(GhostLifecycleState::Awake);
         let b = validate(w).unwrap();
         assert_eq!(b.spiffe_seat(), None);
         assert_eq!(b.molt_epoch(), 3);
@@ -511,36 +515,44 @@ mod tests {
 
     #[test]
     fn malformed_seats_are_refused() {
+        let prefix = "expected the spiffe://unsigned.gg/agent/ prefix";
+        let shape = "expected TEAM/SLUG after the prefix";
+        let empty = "a segment is empty";
+        let charset = "a segment holds a character outside [a-z0-9-]";
         let bad = [
-            "",
-            "agent/platform/sadr",
-            "spiffe://unsigned.gg/agent/platform",
-            "spiffe://unsigned.gg/agent//sadr",
-            "spiffe://unsigned.gg/agent/platform/",
-            "spiffe://unsigned.gg/agent/platform/sadr/extra",
-            "spiffe://unsigned.gg/agent/Platform/sadr",
-            "spiffe://unsigned.gg/agent/platform/sa_dr",
-            "spiffe://unsigned.gg/agent/platform/sa.dr",
-            "spiffe://unsigned.gg/agent/platform/..",
-            "spiffe://unsigned.gg/conclave/ceres/elf/w1",
-            "spiffe://unsigned.gg/human/ctodie",
-            "spiffe://cerebral.internal/agent/platform/sadr",
-            "spiffe://unsigned.gg.evil/agent/platform/sadr",
-            "spiffe://unsigned.gg/agent/platform/sadr ",
-            "spiffe://unsigned.gg/agent/platform/sadr?x=1",
+            ("agent/platform/sadr", prefix),
+            ("spiffe://unsigned.gg/agent/platform", shape),
+            ("spiffe://unsigned.gg/agent//sadr", empty),
+            ("spiffe://unsigned.gg/agent/platform/", empty),
+            ("spiffe://unsigned.gg/agent/platform/sadr/extra", charset),
+            ("spiffe://unsigned.gg/agent/Platform/sadr", charset),
+            ("spiffe://unsigned.gg/agent/platform/sa_dr", charset),
+            ("spiffe://unsigned.gg/agent/platform/sa.dr", charset),
+            ("spiffe://unsigned.gg/agent/platform/..", charset),
+            ("spiffe://unsigned.gg/conclave/ceres/elf/w1", prefix),
+            ("spiffe://unsigned.gg/human/ctodie", prefix),
+            ("spiffe://cerebral.internal/agent/platform/sadr", prefix),
+            ("spiffe://unsigned.gg.evil/agent/platform/sadr", prefix),
+            ("spiffe://unsigned.gg/agent/platform/sadr ", charset),
+            ("spiffe://unsigned.gg/agent/platform/sadr?x=1", charset),
         ];
-        for seat in bad {
+        for (seat, reason) in bad {
             let mut w = wire(GhostManifestation::Agent);
             w.spiffe_seat = Some(seat.to_owned());
-            assert!(
-                matches!(
-                    validate(w),
-                    Err(GhostBindingError::InvalidSpiffeSeat { .. }
-                        | GhostBindingError::EmptyField { .. })
-                ),
-                "seat `{seat}` must be refused"
+            assert_eq!(
+                err(w),
+                GhostBindingError::InvalidSpiffeSeat { reason },
+                "seat `{seat}` must be refused with that reason"
             );
         }
+        let mut w = wire(GhostManifestation::Agent);
+        w.spiffe_seat = Some(String::new());
+        assert_eq!(
+            err(w),
+            GhostBindingError::EmptyField {
+                field: "spiffe_seat"
+            }
+        );
     }
 
     #[test]
@@ -611,10 +623,12 @@ mod tests {
             "{GHOST_SPIFFE_AGENT_PREFIX}team/{}",
             "s".repeat(MAX_SEAT_SEGMENT_BYTES + 1)
         ));
-        assert!(matches!(
+        assert_eq!(
             err(w),
-            GhostBindingError::InvalidSpiffeSeat { .. }
-        ));
+            GhostBindingError::InvalidSpiffeSeat {
+                reason: "a segment is longer than 63 bytes"
+            }
+        );
         let mut w = wire(GhostManifestation::Agent);
         w.spiffe_seat = Some(format!(
             "{GHOST_SPIFFE_AGENT_PREFIX}team/{}",
@@ -646,11 +660,11 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_state_is_kept_when_valid() {
+    fn state_is_kept_when_valid() {
         let mut w = wire(GhostManifestation::Muse);
-        w.lifecycle_state = Some(GhostLifecycleState::Dormant);
+        w.state = Some(GhostLifecycleState::Dormant);
         let b = validate(w).unwrap();
-        assert_eq!(b.lifecycle_state(), Some(GhostLifecycleState::Dormant));
+        assert_eq!(b.state(), Some(GhostLifecycleState::Dormant));
     }
 
     #[test]
@@ -675,9 +689,14 @@ mod tests {
         let b: GhostBinding = serde_json::from_str(ok).unwrap();
         assert_eq!(b.ghost_id(), "x1");
         let bad = r#"{"ghost_id":"x1","manifestation":"crew","mitc_principal":"ctodie","molt_epoch":0,"spiffe_seat":"spiffe://unsigned.gg/agent/t/x1"}"#;
-        assert!(serde_json::from_str::<GhostBinding>(bad).is_err());
+        let refused = serde_json::from_str::<GhostBinding>(bad).unwrap_err();
+        assert!(refused.to_string().contains("spiffe seat"), "{refused}");
         let unknown = r#"{"ghost_id":"x1","manifestation":"wizard","mitc_principal":"ctodie","molt_epoch":0}"#;
-        assert!(serde_json::from_str::<GhostBinding>(unknown).is_err());
+        let refused = serde_json::from_str::<GhostBinding>(unknown).unwrap_err();
+        assert!(refused.to_string().contains("wizard"), "{refused}");
+        let dormant_crew = r#"{"ghost_id":"x1","manifestation":"crew","mitc_principal":"ctodie","molt_epoch":0,"state":"dormant"}"#;
+        let refused = serde_json::from_str::<GhostBinding>(dormant_crew).unwrap_err();
+        assert!(refused.to_string().contains("dormant"), "{refused}");
         let round: GhostBindingWire = b.clone().into();
         assert_eq!(GhostBinding::try_from(round).unwrap(), b);
     }
@@ -685,6 +704,22 @@ mod tests {
     #[test]
     fn deserialize_refuses_unknown_fields() {
         let json = r#"{"ghost_id":"x1","manifestation":"crew","mitc_principal":"ctodie","molt_epoch":0,"extra":1}"#;
-        assert!(serde_json::from_str::<GhostBinding>(json).is_err());
+        let refused = serde_json::from_str::<GhostBinding>(json).unwrap_err();
+        assert!(
+            refused.to_string().contains("unknown field `extra`"),
+            "{refused}"
+        );
+    }
+
+    // A full cortex `GhostLifecycleRecord` is refused by design. The sender
+    // projects it to the binding fields first.
+    #[test]
+    fn full_cortex_record_fields_are_refused() {
+        let json = r#"{"ghost_id":"x1","manifestation":"crew","mitc_principal":"ctodie","molt_epoch":0,"shell_id":"ceres/w1:p1"}"#;
+        let refused = serde_json::from_str::<GhostBinding>(json).unwrap_err();
+        assert!(
+            refused.to_string().contains("unknown field `shell_id`"),
+            "{refused}"
+        );
     }
 }
