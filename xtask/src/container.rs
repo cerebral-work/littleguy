@@ -133,7 +133,8 @@ fn check_build_image_workflow(build_image_yml: &str) -> Result<()> {
     }
     let curl_argv_auth = Regex::new(r"(?m)\bcurl\b[^\n]*(\s-u\b|\s--user\b)")
         .context("compile curl argv auth regex")?;
-    if curl_argv_auth.is_match(build_image_yml) {
+    let collapsed = build_image_yml.replace("\\\n", " ");
+    if curl_argv_auth.is_match(&collapsed) {
         bail!(
             ".github/workflows/build-image.yml must not pass credentials via `curl -u` / `--user` argv; use `--netrc-file`"
         );
@@ -322,7 +323,7 @@ jobs:
 
         let curl_argv_secret = VALID_BUILD_IMAGE_YML.replace(
             "curl -s --netrc-file \"$netrc\"",
-            "curl -s -u \"$U:$P\" --netrc-file \"$netrc\"",
+            "curl -s \\\n            -u \"$U:$P\" \\\n            --netrc-file \"$netrc\"",
         );
         assert!(
             check_contents(

@@ -35,7 +35,13 @@ env:
 jobs:
   preflight:
     name: Check Harbor and Cosign secret readiness
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -49,11 +55,15 @@ jobs:
           HAS_HARBOR_PASS: ${{ secrets.HARBOR_PLATFORM_PUSH_PASSWORD != '' }}
           HAS_COSIGN_KEY: ${{ secrets.COSIGN_PRIVATE_KEY != '' }}
           HAS_COSIGN_PASS: ${{ secrets.COSIGN_PASSWORD != '' }}
+          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_RUN_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "workflow_run" ]; then
+            [ "$WORKFLOW_RUN_EVENT" = "push" ] || { echo "::error::workflow_run event '$WORKFLOW_RUN_EVENT' is not push"; exit 1; }
+            [ "$WORKFLOW_RUN_REPO" = "$GITHUB_REPOSITORY" ] || { echo "::error::workflow_run repo '$WORKFLOW_RUN_REPO' is not $GITHUB_REPOSITORY"; exit 1; }
             [ "$WORKFLOW_RUN_BRANCH" = "main" ] || { echo "::error::workflow_run branch '$WORKFLOW_RUN_BRANCH' is not main"; exit 1; }
             target_sha="$WORKFLOW_RUN_SHA"
           else
@@ -87,7 +97,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.preflight.outputs.sha }}
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Verify target commit is on origin/main
+        env:
+          TARGET_SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if ! git show-ref --verify --quiet refs/remotes/origin/main; then
+            git fetch --no-tags "https://github.com/$GITHUB_REPOSITORY.git" +refs/heads/main:refs/remotes/origin/main
+          fi
+          git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/main
 
       - name: Install SHA-256 pinned crane, cosign, trivy, and syft
         run: |
@@ -119,9 +140,12 @@ jobs:
           set -euo pipefail
           ver=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           [ -n "$ver" ] || { echo "::error::no workspace version in Cargo.toml"; exit 1; }
+          netrc="$RUNNER_TEMP/harbor.netrc"
+          (umask 077; printf 'machine %s\nlogin %s\npassword %s\n' "$HARBOR_REGISTRY" "$PUSH_USER" "$PUSH_PASS" > "$netrc")
           code=$(curl -s -o /dev/null -w '%{http_code}' \
-            -u "$PUSH_USER:$PUSH_PASS" \
+            --netrc-file "$netrc" \
             "https://$HARBOR_REGISTRY/v2/platform/littleguy/tags/list")
+          rm -f "$netrc"
           case "$code" in
             401|403)
               echo "::error::HARBOR_PLATFORM_PUSH_USERNAME cannot access platform/littleguy (HTTP $code)"
@@ -209,4 +233,4 @@ jobs:
       - name: Clean up temporary credentials
         if: always()
         run: |
-          rm -rf "$RUNNER_TEMP/docker" "$RUNNER_TEMP/cosign.key" "$RUNNER_TEMP/cosign.pub" "$RUNNER_TEMP/kyverno.pub" "$RUNNER_TEMP/littleguy.tar" || true
+          rm -rf "$RUNNER_TEMP/docker" "$RUNNER_TEMP/harbor.netrc" "$RUNNER_TEMP/cosign.key" "$RUNNER_TEMP/cosign.pub" "$RUNNER_TEMP/kyverno.pub" "$RUNNER_TEMP/littleguy.tar" || true
