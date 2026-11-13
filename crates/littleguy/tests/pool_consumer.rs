@@ -790,3 +790,112 @@ async fn empty_recv_with_zero_wait_ms_does_not_spin() -> TestResult {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn zero_attempt_number_and_string_run_turn_and_reply_zero() -> TestResult {
+    let mut num_zero = delivery("tok-att-0-num", 171, "t-att-0-num", "first-zero-num");
+    num_zero["message"]["refs"]["attempt"] = json!(0);
+
+    let mut str_zero = delivery("tok-att-0-str", 172, "t-att-0-str", "first-zero-str");
+    str_zero["message"]["refs"]["attempt"] = json!("0");
+
+    let mut absent = delivery("tok-att-absent", 173, "t-att-absent", "absent-fallback");
+    if let Some(obj) = absent["message"]["refs"].as_object_mut() {
+        obj.remove("attempt");
+    }
+    absent["delivery_attempt"] = json!(0);
+
+    let mut null_att = delivery("tok-att-null", 174, "t-att-null", "null-fallback");
+    null_att["message"]["refs"]["attempt"] = Value::Null;
+    null_att["delivery_attempt"] = json!(3);
+
+    let bad_values = [
+        json!(-1),
+        json!("-1"),
+        json!(1.5),
+        json!("1.5"),
+        json!(4_294_967_296_u64),
+        json!("4294967296"),
+        json!("+0"),
+        json!("abc"),
+        json!(true),
+    ];
+    let mut items = vec![num_zero, str_zero, absent, null_att];
+    for (idx, bad) in bad_values.iter().enumerate() {
+        let seq = 180 + u64::try_from(idx)?;
+        let mut item = delivery(
+            &format!("tok-att-bad-{idx}"),
+            seq,
+            &format!("t-att-bad-{idx}"),
+            "never-runs",
+        );
+        item["message"]["refs"]["attempt"] = bad.clone();
+        items.push(item);
+    }
+
+    let rig = start_rig(items).await?;
+    let mut worker = PoolWorker::new(rig.cfg.clone(), rig.client.clone(), &rig.runner);
+    assert_eq!(worker.step().await?, StepOutcome::Settled);
+    assert_eq!(worker.step().await?, StepOutcome::Settled);
+    assert_eq!(worker.step().await?, StepOutcome::Settled);
+    assert_eq!(worker.step().await?, StepOutcome::Settled);
+    for _ in &bad_values {
+        assert_eq!(worker.step().await?, StepOutcome::Termed);
+    }
+    assert_eq!(rig.model.calls(), 4);
+
+    let g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(g.sends.len(), 4);
+    assert_eq!(g.sends[0]["message"]["refs"]["attempt"], json!(0));
+    assert_eq!(g.sends[1]["message"]["refs"]["attempt"], json!(0));
+    assert_eq!(g.sends[2]["message"]["refs"]["attempt"], json!(1));
+    assert_eq!(g.sends[3]["message"]["refs"]["attempt"], json!(3));
+    assert_eq!(
+        g.acks,
+        vec![
+            "tok-att-0-num",
+            "tok-att-0-str",
+            "tok-att-absent",
+            "tok-att-null",
+        ]
+    );
+    assert_eq!(g.terms.len(), bad_values.len());
+    for (_, reason) in &g.terms {
+        assert_eq!(reason, "refused: invalid attempt");
+    }
+    drop(g);
+    Ok(())
+}
+
+#[tokio::test]
+async fn zero_attempt_idempotency_cache_replays_and_separates_attempt_one() -> TestResult {
+    let mut first = delivery("tok-cache-0a", 191, "t-cache-0", "compute-zero-once");
+    first["message"]["refs"]["attempt"] = json!(0);
+
+    let mut redelivered = delivery("tok-cache-0b", 192, "t-cache-0", "compute-zero-once");
+    redelivered["delivery_attempt"] = json!(2);
+    redelivered["message"]["refs"]["attempt"] = json!("0");
+
+    let mut next_attempt = delivery("tok-cache-1", 193, "t-cache-0", "compute-one");
+    next_attempt["message"]["refs"]["attempt"] = json!(1);
+
+    let rig = start_rig(vec![first, redelivered, next_attempt]).await?;
+    let mut worker = PoolWorker::new(rig.cfg.clone(), rig.client.clone(), &rig.runner);
+    assert_eq!(worker.step().await?, StepOutcome::Settled);
+    assert_eq!(worker.step().await?, StepOutcome::ReplayedFromCache);
+    assert_eq!(worker.step().await?, StepOutcome::Settled);
+    assert_eq!(rig.model.calls(), 2);
+
+    let g = rig.stub.0.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(g.sends.len(), 3);
+    assert_eq!(g.sends[0]["message"]["refs"]["attempt"], json!(0));
+    assert_eq!(g.sends[0]["message"]["refs"]["stream_seq"], json!(191));
+    assert_eq!(g.sends[1]["message"]["refs"]["attempt"], json!(0));
+    assert_eq!(g.sends[1]["message"]["refs"]["stream_seq"], json!(192));
+    assert_eq!(g.sends[2]["message"]["refs"]["attempt"], json!(1));
+    assert_eq!(g.sends[2]["message"]["refs"]["stream_seq"], json!(193));
+    assert_eq!(g.acks, vec!["tok-cache-0a", "tok-cache-0b", "tok-cache-1"]);
+    assert_eq!(g.terms, Vec::new());
+    drop(g);
+    Ok(())
+}
