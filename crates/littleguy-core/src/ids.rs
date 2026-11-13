@@ -42,6 +42,20 @@ pub enum IdError {
         /// The id type.
         kind: &'static str,
     },
+    /// The text does not have hyphenated UUID (`8-4-4-4-12` hex) shape.
+    #[error("the {kind} must be a hyphenated UUID (8-4-4-4-12 hex)")]
+    InvalidUuid {
+        /// The id type.
+        kind: &'static str,
+    },
+}
+
+fn is_uuid_shape(text: &str) -> bool {
+    text.len() == 36
+        && text.bytes().enumerate().all(|(idx, byte)| match idx {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
 /// Checks the shape that every id shares: printable ASCII, not empty, bounded.
@@ -158,11 +172,68 @@ id_type!(
     RoleName,
     "role name"
 );
-id_type!(
-    /// The peer id of a Cortex pool member.
-    PoolPeerId,
-    "pool peer id"
-);
+/// The peer UUID of a Cortex pool member (`8-4-4-4-12` hex).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct PoolPeerId(String);
+
+impl PoolPeerId {
+    /// Checks `text` for printable ASCII and hyphenated UUID shape and wraps it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdError`] when `text` is empty, over [`MAX_ID_BYTES`], not
+    /// printable ASCII, or not `8-4-4-4-12` hexadecimal.
+    pub fn new(text: impl Into<String>) -> Result<Self, IdError> {
+        let text = text.into();
+        check_with(
+            "pool peer id",
+            MAX_ID_BYTES,
+            |kind| IdError::TooLong { kind },
+            &text,
+        )?;
+        if !is_uuid_shape(&text) {
+            return Err(IdError::InvalidUuid {
+                kind: "pool peer id",
+            });
+        }
+        Ok(Self(text))
+    }
+
+    /// The peer UUID as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for PoolPeerId {
+    type Error = IdError;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::new(text)
+    }
+}
+
+impl From<PoolPeerId> for String {
+    fn from(id: PoolPeerId) -> Self {
+        id.0
+    }
+}
+
+impl fmt::Display for PoolPeerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for PoolPeerId {
+    type Err = IdError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::new(text)
+    }
+}
 id_type!(
     /// An opaque lease token returned by Cortex `/v1/mesh/pool/recv`.
     DeliveryToken,

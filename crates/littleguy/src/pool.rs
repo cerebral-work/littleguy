@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::io::Read as _;
+use std::io::{self, Read as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,6 +21,8 @@ use littleguy_stores::{
     AdapterError, HttpMethod, HttpTransport, ReqwestHttpTransport, StoreHttpRequest,
     StoreHttpResponse, join_url_segments, parse_clean_base_url, sha256_hex,
 };
+use rustix::fs::{Mode, OFlags, open};
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -29,12 +31,12 @@ use thiserror::Error;
 pub const DEFAULT_ALLOWED_SENDER: &str = "service-escapement-pool";
 /// Default Cortex role reported by this worker (`escapement-serve/src/pool.rs:182`).
 pub const DEFAULT_MEMBER_ROLE: &str = "service-pool-littleman-1";
-/// Default peer UUID when `--peer-id` is omitted.
-pub const DEFAULT_PEER_ID: &str = "00000000-0000-0000-0000-000000000001";
 /// Default long-poll wait in milliseconds for `/v1/mesh/pool/recv`.
 pub const DEFAULT_WAIT_MS: u32 = 5_000;
 /// Default redelivery delay in milliseconds for `/v1/mesh/pool/nack`.
 pub const DEFAULT_NACK_DELAY_MS: u32 = 5_000;
+/// Maximum size in bytes of the `--token-file` read (`REQ-LG-POOL-01`).
+pub const MAX_TOKEN_FILE_BYTES: usize = 4 * 1024;
 /// Maximum inbound delivery body bytes (`escapement-serve/src/pool.rs:44` `POOL_BODY_MAX`).
 pub const MAX_DELIVERY_BODY_BYTES: usize = 12 * 1024;
 /// Maximum inbound delivery subject bytes (`escapement-serve/src/pool.rs:48` `POOL_SUBJECT_MAX`).
@@ -43,8 +45,12 @@ pub const MAX_DELIVERY_SUBJECT_BYTES: usize = 512;
 pub const MAX_DELIVERY_REFS_BYTES: usize = 16 * 1024;
 /// Maximum reply body bytes (`escapement-serve/src/pool.rs:1005` `MAX_RESULT_BYTES`).
 pub const MAX_REPLY_BODY_BYTES: usize = 8 * 1024;
+/// Maximum characters in `refs.error` and `body.error` on permanent turn failures.
+pub const MAX_ERROR_CHARS: usize = 1_024;
 /// Maximum `(TaskId, attempt)` entries held in the worker idempotency cache.
 pub const MAX_CACHED_RESULTS: usize = 256;
+/// Maximum raw delivery token bytes accepted when settling a poison delivery with `term`.
+const MAX_RAW_SETTLE_TOKEN_BYTES: usize = 4 * 1024;
 
 /// Errors returned while configuring or running `lg pool`.
 #[derive(Debug, Error)]
@@ -66,10 +72,16 @@ pub enum PoolError {
     TokenFileOwner {
         /// File owner UID.
         owner_uid: u32,
-        /// Current process UID.
+        /// Expected effective UID.
         expected_uid: u32,
     },
-    /// The token file contents are empty or contain non-graphic ASCII bytes.
+    /// `--token-file` exceeds [`MAX_TOKEN_FILE_BYTES`].
+    #[error("the pool token file exceeds {max_bytes} bytes")]
+    TokenFileTooLarge {
+        /// Maximum permitted size in bytes.
+        max_bytes: usize,
+    },
+    /// The token file contents are empty, non-UTF-8, or contain non-graphic ASCII bytes.
     #[error("the pool token file does not hold a valid bearer token")]
     TokenInvalid,
     /// `--cortex-url` failed clean base URL validation.
@@ -78,17 +90,40 @@ pub enum PoolError {
     /// An HTTP call to Cortex failed.
     #[error("cortex pool HTTP call failed: {message}")]
     Transport {
-        /// Whether the failure is retryable (`429`, `5xx`, or network failure).
+        /// HTTP status code when Cortex returned a non-2xx response.
+        status: Option<u16>,
+        /// Whether a retry could succeed (`429`, `5xx`, or network failure).
         retryable: bool,
         /// Redacted diagnostic message without bearer credentials.
         message: String,
     },
-    /// A JSON response from Cortex failed to decode.
+    /// A JSON payload failed to serialize or decode.
     #[error("cortex pool JSON decode failed: {0}")]
     Decode(String),
     /// Opening the local SQLite runtime or seat substrate failed.
     #[error("pool turn runtime failed: {0}")]
     Runtime(String),
+}
+
+impl PoolError {
+    /// Returns `true` only for startup, configuration, or authentication (`401`/`403`) errors.
+    const fn is_fatal(&self) -> bool {
+        match self {
+            Self::Transport {
+                status: Some(401 | 403),
+                ..
+            }
+            | Self::TokenFileStat(_)
+            | Self::TokenFileNotRegular
+            | Self::TokenFilePermissions { .. }
+            | Self::TokenFileOwner { .. }
+            | Self::TokenFileTooLarge { .. }
+            | Self::TokenInvalid
+            | Self::InvalidUrl(_)
+            | Self::Runtime(_) => true,
+            Self::Transport { .. } | Self::Decode(_) => false,
+        }
+    }
 }
 
 /// Redacted bearer token read from a `0600` regular file (`REQ-LG-POOL-01`).
@@ -102,27 +137,34 @@ impl fmt::Debug for PoolToken {
 }
 
 impl PoolToken {
-    /// Loads a bearer token from `path` for the current user (`0600`, regular file).
+    /// Loads a bearer token from `path` for the process effective UID (`0600`, regular file).
     ///
     /// # Errors
     ///
-    /// Returns [`PoolError`] when `path` fails file-type, permission, owner, or content checks.
+    /// Returns [`PoolError`] when `path` fails `O_NOFOLLOW` open, file-type, mode, effective UID,
+    /// size (`<= 4 KiB`), or token-byte checks.
     pub fn load(path: &Path) -> Result<Self, PoolError> {
-        Self::load_for_uid(path, rustix::process::getuid().as_raw())
+        Self::load_for_uid(path, rustix::process::geteuid().as_raw())
     }
 
     /// Loads a bearer token from `path`, checking ownership against `expected_uid`.
     ///
     /// # Errors
     ///
-    /// Returns [`PoolError`] when `path` fails file-type, permission, owner, or content checks.
+    /// Returns [`PoolError`] when `path` fails `O_NOFOLLOW` open, file-type, mode, owner, size,
+    /// or token-byte checks.
     pub fn load_for_uid(path: &Path, expected_uid: u32) -> Result<Self, PoolError> {
-        let stat_err = |e: std::io::Error| PoolError::TokenFileStat(e.kind().to_string());
-        let link = std::fs::symlink_metadata(path).map_err(stat_err)?;
-        if link.file_type().is_symlink() || !link.file_type().is_file() {
-            return Err(PoolError::TokenFileNotRegular);
-        }
-        let mut file = std::fs::File::open(path).map_err(stat_err)?;
+        let stat_err = |e: io::Error| PoolError::TokenFileStat(e.kind().to_string());
+        let fd = match open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::LOOP | Errno::ISDIR) => return Err(PoolError::TokenFileNotRegular),
+            Err(err) => return Err(stat_err(io::Error::from(err))),
+        };
+        let file = std::fs::File::from(fd);
         let meta = file.metadata().map_err(stat_err)?;
         if !meta.file_type().is_file() {
             return Err(PoolError::TokenFileNotRegular);
@@ -137,8 +179,23 @@ impl PoolToken {
                 expected_uid,
             });
         }
-        let mut raw = String::new();
-        file.read_to_string(&mut raw).map_err(stat_err)?;
+        let max_u64 = u64::try_from(MAX_TOKEN_FILE_BYTES).unwrap_or(u64::MAX - 1);
+        if meta.len() > max_u64 {
+            return Err(PoolError::TokenFileTooLarge {
+                max_bytes: MAX_TOKEN_FILE_BYTES,
+            });
+        }
+        let mut buf = Vec::with_capacity(256);
+        (&file)
+            .take(max_u64.saturating_add(1))
+            .read_to_end(&mut buf)
+            .map_err(stat_err)?;
+        if buf.len() > MAX_TOKEN_FILE_BYTES {
+            return Err(PoolError::TokenFileTooLarge {
+                max_bytes: MAX_TOKEN_FILE_BYTES,
+            });
+        }
+        let raw = std::str::from_utf8(&buf).map_err(|_| PoolError::TokenInvalid)?;
         let trimmed = raw.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_graphic()) {
             return Err(PoolError::TokenInvalid);
@@ -187,6 +244,14 @@ struct RawLaneMessage {
     body: Option<String>,
     #[serde(default)]
     refs: Option<Value>,
+}
+
+enum RecvItem {
+    Valid(RawDelivery),
+    Malformed {
+        raw_token: Option<String>,
+        reason: String,
+    },
 }
 
 /// HTTP client for Cortex `/v1/mesh/pool/{recv,ack,extend,nack,term}` and `/v1/mesh/send`.
@@ -241,16 +306,37 @@ impl PoolClient {
             .map_err(map_adapter_err)
     }
 
-    async fn recv(
-        &self,
-        peer_id: &PoolPeerId,
-        wait_ms: u32,
-    ) -> Result<Vec<RawDelivery>, PoolError> {
+    async fn recv(&self, peer_id: &PoolPeerId, wait_ms: u32) -> Result<Vec<RecvItem>, PoolError> {
         let body = json!({ "peer_id": peer_id.as_str(), "free_slots": 1 });
-        self.post(&["v1", "mesh", "pool", "recv"], Some(wait_ms), &body)
-            .await?
-            .decode_json("pool recv response")
-            .map_err(|e| PoolError::Decode(e.to_string()))
+        let resp = self
+            .post(&["v1", "mesh", "pool", "recv"], Some(wait_ms), &body)
+            .await?;
+        let Ok(Value::Array(items)) = serde_json::from_slice::<Value>(&resp.body) else {
+            tracing::warn!(
+                body_bytes = resp.body.len(),
+                "malformed pool recv payload; skipping cycle"
+            );
+            return Ok(Vec::new());
+        };
+        Ok(items
+            .into_iter()
+            .map(|item| {
+                let tok = item
+                    .get("delivery_token")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                serde_json::from_value::<RawDelivery>(item).map_or_else(
+                    |e| RecvItem::Malformed {
+                        raw_token: tok,
+                        reason: format!(
+                            "malformed delivery: {}",
+                            truncate_chars(&e.to_string(), 200)
+                        ),
+                    },
+                    RecvItem::Valid,
+                )
+            })
+            .collect())
     }
 
     async fn settle(&self, action: &str, body: &Value) -> Result<(), PoolError> {
@@ -281,10 +367,12 @@ impl PoolClient {
 fn map_adapter_err(err: AdapterError) -> PoolError {
     match err {
         AdapterError::HttpStatus { status, url, body } => PoolError::Transport {
+            status: Some(status),
             retryable: status == 429 || status >= 500,
             message: format!("HTTP {status} from {url}: {body}"),
         },
         AdapterError::Transport { message } => PoolError::Transport {
+            status: None,
             retryable: true,
             message,
         },
@@ -570,13 +658,13 @@ async fn drive_sqlite_turn(
 /// Outcome of one [`PoolWorker::step`] poll cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepOutcome {
-    /// `/v1/mesh/pool/recv` returned no deliveries.
+    /// `/v1/mesh/pool/recv` returned no usable deliveries (or skipped an untokened poison entry).
     Idle,
     /// Valid delivery executed one turn, sent its reply, and called `ack`.
     Settled,
     /// Redelivery matched the `(TaskId, attempt)` cache, re-sent the reply, and called `ack`.
     ReplayedFromCache,
-    /// Unauthorized or malformed delivery was refused with `term` and ran no turn.
+    /// Unauthorized, malformed, or non-retryably rejected delivery was settled with `term`.
     Termed,
     /// Transient turn or send failure called `nack` with backoff delay.
     Nacked,
@@ -621,49 +709,64 @@ impl<R: TurnRunner> PoolWorker<R> {
 
     /// Polls Cortex once (`free_slots: 1`) and processes any returned delivery.
     ///
+    /// Per-delivery poison tokens, malformed payloads, and non-auth HTTP errors are
+    /// logged and settled (or skipped so the lease expires) without stopping the worker.
+    ///
     /// # Errors
     ///
-    /// Returns [`PoolError`] when `/v1/mesh/pool/recv` or lease settlement fails.
+    /// Returns [`PoolError`] when `/v1/mesh/pool/recv` fails or Cortex returns `401`/`403`.
     pub async fn step(&mut self) -> Result<StepOutcome, PoolError> {
         let batch = self
             .client
             .recv(&self.config.peer_id, self.config.wait_ms)
             .await?;
-        let Some(raw) = batch.into_iter().next() else {
+        let Some(item) = batch.into_iter().next() else {
             return Ok(StepOutcome::Idle);
         };
-        let token = DeliveryToken::new(raw.delivery_token.as_str())
-            .map_err(|e| PoolError::Decode(e.to_string()))?;
+        let raw = match item {
+            RecvItem::Valid(raw) => raw,
+            RecvItem::Malformed { raw_token, reason } => {
+                return self.settle_poison(raw_token.as_deref(), &reason).await;
+            }
+        };
+        let Ok(token) = DeliveryToken::new(raw.delivery_token.as_str()) else {
+            return self
+                .settle_poison(
+                    Some(raw.delivery_token.as_str()),
+                    "refused: invalid delivery_token",
+                )
+                .await;
+        };
         let input = match validate_delivery(&raw, &self.config) {
             Ok(valid) => valid,
-            Err(reason) => {
-                let body = json!({ "peer_id": self.config.peer_id.as_str(), "delivery_token": token.as_str(), "reason": reason });
-                self.client.settle("term", &body).await?;
-                return Ok(StepOutcome::Termed);
-            }
+            Err(reason) => return self.term_token(token.as_str(), &reason).await,
         };
         let key = (input.task_id.clone(), input.attempt);
         if let Some(mut hit) = self.cache.get(&key).cloned() {
             hit.refs.insert("stream_seq".into(), json!(raw.stream_seq));
             return self
-                .send_and_settle(&token, &input.task_id, &hit, StepOutcome::ReplayedFromCache)
+                .send_and_settle(&key, &token, &hit, StepOutcome::ReplayedFromCache)
                 .await;
         }
         match self.run_with_extend(&token, raw.lease_ms, &input).await {
             Ok(out) => {
                 let reply = build_ok_reply(&input, &out, raw.stream_seq);
-                self.put_cache(key, reply.clone());
-                self.send_and_settle(&token, &input.task_id, &reply, StepOutcome::Settled)
+                self.put_cache(key.clone(), reply.clone());
+                self.send_and_settle(&key, &token, &reply, StepOutcome::Settled)
                     .await
             }
             Err(TurnError::Transient(why)) => {
-                tracing::warn!(task_id = %input.task_id, reason = %why, "transient turn failure; nacking");
+                tracing::warn!(
+                    task_id = %input.task_id,
+                    reason = %truncate_chars(&why, 256),
+                    "transient turn failure; nacking"
+                );
                 self.nack(&token).await
             }
             Err(TurnError::Permanent(why)) => {
                 let reply = build_failed_reply(&input, raw.stream_seq, &why);
-                self.put_cache(key, reply.clone());
-                self.send_and_settle(&token, &input.task_id, &reply, StepOutcome::Settled)
+                self.put_cache(key.clone(), reply.clone());
+                self.send_and_settle(&key, &token, &reply, StepOutcome::Settled)
                     .await
             }
         }
@@ -673,7 +776,7 @@ impl<R: TurnRunner> PoolWorker<R> {
     ///
     /// # Errors
     ///
-    /// Propagates non-retryable [`PoolError`] failures.
+    /// Propagates startup, configuration, or authentication (`401`/`403`) [`PoolError`] failures.
     pub async fn run_until(
         &mut self,
         stop: impl Future<Output = ()> + Send,
@@ -683,15 +786,62 @@ impl<R: TurnRunner> PoolWorker<R> {
             tokio::select! {
                 () = &mut stop => return Ok(()),
                 res = self.step() => if let Err(err) = res {
-                    if matches!(err, PoolError::Transport { retryable: true, .. }) {
-                        tracing::warn!(error = %err, "transient pool poll error; backing off");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    } else {
+                    if err.is_fatal() {
                         return Err(err);
                     }
+                    tracing::warn!(
+                        reason = %truncate_chars(&err.to_string(), 256),
+                        "pool poll error; backing off"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
         }
+    }
+
+    async fn best_effort_settle(&self, action: &str, body: &Value) -> Result<bool, PoolError> {
+        match self.client.settle(action, body).await {
+            Ok(()) => Ok(true),
+            Err(err) if err.is_fatal() => Err(err),
+            Err(err) => {
+                tracing::warn!(
+                    action,
+                    reason = %truncate_chars(&err.to_string(), 256),
+                    "pool lease settlement failed; continuing"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    async fn term_token(&self, token_str: &str, reason: &str) -> Result<StepOutcome, PoolError> {
+        let body = json!({
+            "peer_id": self.config.peer_id.as_str(),
+            "delivery_token": token_str,
+            "reason": truncate_chars(reason, 256),
+        });
+        let _ = self.best_effort_settle("term", &body).await?;
+        Ok(StepOutcome::Termed)
+    }
+
+    async fn settle_poison(
+        &self,
+        raw_token: Option<&str>,
+        reason: &str,
+    ) -> Result<StepOutcome, PoolError> {
+        tracing::warn!(
+            token_len = raw_token.map_or(0, str::len),
+            reason = %truncate_chars(reason, 256),
+            "poison pool delivery; settling or letting lease expire"
+        );
+        if let Some(tok) = raw_token.filter(|t| {
+            !t.is_empty()
+                && t.len() <= MAX_RAW_SETTLE_TOKEN_BYTES
+                && !t.bytes().any(|b| b.is_ascii_control())
+        }) {
+            return self.term_token(tok, reason).await;
+        }
+        Ok(StepOutcome::Idle)
     }
 
     async fn run_with_extend(
@@ -727,23 +877,30 @@ impl<R: TurnRunner> PoolWorker<R> {
         self.cache.insert(key, reply);
     }
 
+    fn remove_cache(&mut self, key: &(TaskId, u32)) {
+        if self.cache.remove(key).is_some() {
+            self.cache_order.retain(|k| k != key);
+        }
+    }
+
     async fn nack(&self, token: &DeliveryToken) -> Result<StepOutcome, PoolError> {
         let body = json!({
             "peer_id": self.config.peer_id.as_str(),
             "delivery_token": token.as_str(),
             "delay_ms": self.config.nack_delay_ms,
         });
-        self.client.settle("nack", &body).await?;
+        let _ = self.best_effort_settle("nack", &body).await?;
         Ok(StepOutcome::Nacked)
     }
 
     async fn send_and_settle(
-        &self,
+        &mut self,
+        key: &(TaskId, u32),
         token: &DeliveryToken,
-        task_id: &TaskId,
         reply: &CachedReply,
         success: StepOutcome,
     ) -> Result<StepOutcome, PoolError> {
+        let task_id = &key.0;
         let subject = format!("result {task_id} {}", reply.outcome);
         match self
             .client
@@ -751,18 +908,32 @@ impl<R: TurnRunner> PoolWorker<R> {
             .await
         {
             Ok(()) => {
-                let ack = json!({ "peer_id": self.config.peer_id.as_str(), "delivery_tokens": [token.as_str()] });
-                self.client.settle("ack", &ack).await?;
+                let ack = json!({
+                    "peer_id": self.config.peer_id.as_str(),
+                    "delivery_tokens": [token.as_str()],
+                });
+                let _ = self.best_effort_settle("ack", &ack).await?;
                 Ok(success)
             }
+            Err(err) if err.is_fatal() => Err(err),
             Err(PoolError::Transport {
                 retryable: true,
                 message: msg,
+                ..
             }) => {
-                tracing::warn!(%task_id, reason = %msg, "transient reply send failure; nacking");
+                tracing::warn!(
+                    %task_id,
+                    reason = %truncate_chars(&msg, 256),
+                    "transient reply send failure; keeping cached reply and nacking"
+                );
                 self.nack(token).await
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                let reason = format!("send rejected: {}", truncate_chars(&err.to_string(), 200));
+                tracing::warn!(%task_id, %reason, "non-retryable reply send failure; terming");
+                self.remove_cache(key);
+                self.term_token(token.as_str(), &reason).await
+            }
         }
     }
 }
@@ -858,6 +1029,12 @@ fn parse_attempt(val: Option<&Value>, fallback: u32) -> Result<u32, String> {
         .ok_or_else(|| "refused: invalid attempt".into())
 }
 
+fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    text.char_indices()
+        .nth(max_chars)
+        .map_or(text, |(idx, _)| &text[..idx])
+}
+
 fn base_refs(input: &TurnInput, stream_seq: u64, outcome: &str) -> Map<String, Value> {
     let mut refs = Map::new();
     refs.insert("task_id".into(), json!(input.task_id.as_str())); // escapement-serve/src/pool.rs:960
@@ -910,10 +1087,10 @@ fn build_ok_reply(input: &TurnInput, out: &TurnOutput, stream_seq: u64) -> Cache
 }
 
 fn build_failed_reply(input: &TurnInput, stream_seq: u64, error: &str) -> CachedReply {
+    let short_err = truncate_chars(error, MAX_ERROR_CHARS);
     let mut refs = base_refs(input, stream_seq, "failed"); // escapement-serve/src/pool.rs:1021
     refs.insert("transient".into(), json!(false)); // escapement-serve/src/pool.rs:1033
-    refs.insert("error".into(), json!(error)); // escapement-serve/src/pool.rs:1040
-    let short_err: String = error.chars().take(1_024).collect();
+    refs.insert("error".into(), json!(short_err)); // escapement-serve/src/pool.rs:1040
     let body = json!({ "error": short_err, "shell_id": input.shell_id.as_str() }).to_string();
     CachedReply {
         outcome: "failed",

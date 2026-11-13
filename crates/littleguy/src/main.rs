@@ -206,7 +206,7 @@ struct PoolArgs {
     #[arg(long, env = "LG_POOL_SHELL_ID")]
     shell_id: ShellId,
     /// Registered Cortex peer UUID for this pool worker.
-    #[arg(long, env = "LG_POOL_PEER_ID", default_value = pool::DEFAULT_PEER_ID)]
+    #[arg(long, env = "LG_POOL_PEER_ID")]
     peer_id: PoolPeerId,
     /// Registered Cortex role for this pool worker.
     #[arg(long, env = "LG_POOL_ROLE", default_value = pool::DEFAULT_MEMBER_ROLE)]
@@ -698,6 +698,8 @@ mod tests {
             "http://127.0.0.1:9999",
             "--token-file",
             "/tmp/token",
+            "--peer-id",
+            "11111111-1111-1111-1111-111111111111",
             "--wait-ms",
             "1500",
             "--shell-id",
@@ -708,11 +710,28 @@ mod tests {
             Command::Pool(args) => {
                 assert_eq!(args.cortex_url, "http://127.0.0.1:9999");
                 assert_eq!(args.token_file, PathBuf::from("/tmp/token"));
+                assert_eq!(
+                    args.peer_id.as_str(),
+                    "11111111-1111-1111-1111-111111111111"
+                );
                 assert_eq!(args.allowed_sender.as_str(), "service-escapement-pool");
                 assert_eq!(args.wait_ms, 1500);
                 assert_eq!(args.shell_id.as_str(), "shell-01");
             }
             _ => panic!("expected pool command"),
         }
+        assert!(
+            Cli::try_parse_from([
+                "lg",
+                "pool",
+                "--cortex-url",
+                "http://127.0.0.1:9999",
+                "--token-file",
+                "/tmp/token",
+                "--shell-id",
+                "shell-01",
+            ])
+            .is_err()
+        );
     }
 }
