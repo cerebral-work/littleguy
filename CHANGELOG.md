@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **GhostBinding Validator (`littleguy-core`, `specs/0004`):**
+  - Added the zero-I/O `GhostBinding` type, `GhostBindingWire`, `GhostManifestation`, `GhostLifecycleState` and `validate`, which refuses a binding with a typed `GhostBindingError`. Deserializing a `GhostBinding` runs the validator and refuses unknown fields.
+  - Enforced the cortex REQ-0125-03/-04 rules: a persistent manifestation needs a `spiffe://unsigned.gg/agent/TEAM/SLUG` seat, and `Crew` holds no seat and never enters `dormant` or `dreaming`.
+  - Enforced the caps: `ghost_id` 64 bytes, `mitc_principal` 128, `spiffe_seat` 256, seat segment 63.
+  - Added three fail-closed rules that are stricter than cortex: `ghost_id` is `[a-z0-9-]`, `mitc_principal` refuses control characters and surrounding whitespace, and seat segments refuse `_`. A shape test pins the serialized names to cortex.
+  - Added an optional `ghost_binding` field on `SeatReceipt`, omitted when absent.
+  - Added `BiscuitMandateClaims` tests for the agent and elf SPIFFE forms, with no `mandate_bridge` code change.
 - **Wave 2 Durable Reverie & XERJ Store Adapters (`littleguy-stores`, `specs/0003`):**
   - Added pluggable `HttpTransport` trait with `ReqwestHttpTransport` (`reqwest 0.13` + `rustls` ring) for production and deterministic offline `MockHttpTransport` for tests.
   - Added `ReverieClientConfig`, `ReverieObservationBuilder`, and `ReverieObservationStore` implementing `autumn_harvest_agent` `MemoryStore` and `EpisodeStore` with zero-interpolation `/search?q=...`, `/context/smart?project=...`, and `/observations` requests (`topic_key` + `project` + taint-preserving flow labels).
