@@ -59,13 +59,10 @@ immediately) and uses its secret ahead of `ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY`, or `OPENROUTER_API_KEY`. When `--api-key-file` is omitted,
 `build_model` preserves existing environment-variable lookup unchanged.
 
-**Kubernetes `StatefulSet` contract (Stage B Part 3):** Because kubelet projects
-`Secret` volumes through `..data` symlinks owned by `uid 0`, a Stage B Pod runs
-a minimal non-root `initContainer` using the same `littleguy` image
-(`/usr/bin/install -m 0600` from the read-only `ExternalSecret` mount into an
-`emptyDir: { medium: Memory }` at `/run/littleman/{token,llm-key}` owned by
-`65532:65532`) so both `--token-file` and `--api-key-file` satisfy `O_NOFOLLOW`,
-`0600`, and `geteuid()` checks without relaxing descriptor validation.
+**Kubernetes `StatefulSet` contract (Stage B Parts 2 and 3):** Section 4 below
+defines how Stage B mounts both secret files so `O_NOFOLLOW`, `0600`, and
+`geteuid()` (`65532`) remain enforced without relaxing `SecretFile` or
+`PoolToken`.
 
 ### 2. Multi-Stage Non-Root `Dockerfile` and `.dockerignore`
 
@@ -100,20 +97,65 @@ a minimal non-root `initContainer` using the same `littleguy` image
 - `.github/workflows/ci.yml` adds a `container` job on `ubuntu-latest` that
   builds `Dockerfile` and runs `id -u`, `id -g`, `lg --version`, and
   `lg pool --help` under `--read-only --cap-drop=ALL --security-opt=no-new-privileges`.
-- `.github/workflows/build-image.yml` runs after `CI` succeeds on `main` or via
-  `workflow_dispatch` on `main`. A lightweight `preflight` job checks whether
-  repository secrets `HARBOR_PLATFORM_PUSH_USERNAME`,
+- `.github/workflows/build-image.yml` runs after `CI` succeeds on a `push` to
+  `main` in the canonical repository (`github.event.workflow_run.event == 'push'`
+  and `github.event.workflow_run.head_repository.full_name == github.repository`,
+  refusing fork `workflow_run` events even when a fork branch is named `main`) or
+  via `workflow_dispatch` on `refs/heads/main`. A lightweight `preflight` job
+  checks whether repository secrets `HARBOR_PLATFORM_PUSH_USERNAME`,
   `HARBOR_PLATFORM_PUSH_PASSWORD`, `COSIGN_PRIVATE_KEY`, and `COSIGN_PASSWORD`
   are configured; while any secret is absent, `preflight` emits `ready=false`
   with a notice and the `publish` job (`if: needs.preflight.outputs.ready == 'true'`)
   skips cleanly without failing CI or creating GitHub Environments. Once armed,
-  `publish` builds `Dockerfile`, verifies runtime hardening and layer-size caps
-  (`< 99 MB`, `OPS-810`), runs Trivy (`HIGH,CRITICAL --ignore-unfixed --exit-code 1`),
+  `publish` verifies `git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/main`
+  before building, authenticates the Harbor scope preflight via a `0600`
+  `--netrc-file` (never `curl -u` in process `argv`), builds `Dockerfile`,
+  verifies runtime hardening, runs Trivy (`HIGH,CRITICAL --ignore-unfixed --exit-code 1`),
   pushes immutable tags `git-<12sha>` and `<ver>-<7sha>` (plus `v<ver>` if
   absent, never `:latest`) to `harbor.unsigned.gg/platform/littleguy`, signs the
   `sha256` manifest digest with Cosign (`--tlog-upload=false`), attaches and
   verifies a Syft CycloneDX 1.5 attestation, and writes the pinned digest to
   `$GITHUB_STEP_SUMMARY`.
+
+### 4. Stage B Kubernetes Secret Volume Contract (Parts 2 and 3)
+
+Both `PoolToken::load` (`--token-file`, `specs/0005` `REQ-LG-POOL-01`) and
+`SecretFile::load` (`--api-key-file`, `REQ-LG-CONT-01`) enforce `O_NOFOLLOW`,
+exact mode `0600`, and `st_uid == geteuid()` (`65532`). A raw Kubernetes
+`Secret` mount fails those checks in three ways:
+
+1. A directory `Secret` volume projects keys via `..data/<key>` symlinks, which
+   `O_NOFOLLOW` refuses with `NotRegular`.
+2. A `subPath` mount avoids the symlink and binds a regular file, **but**
+   kubelet creates `Secret` files owned by `uid 0` (`root`), failing
+   `st_uid == 65532` (`Owner { owner_uid: 0, expected_uid: 65532 }`) even with
+   `defaultMode: 0600` and no `fsGroup`.
+3. Setting Pod `securityContext.fsGroup: 65532` makes `Secret` files readable by
+   GID `65532` via group permission bits (`0640` or `0440`), which fails both
+   `st_uid == 65532` and `mode == 0600` (`Permissions { mode: 0o640 }`).
+
+To keep `PoolToken` and `SecretFile` strict without relaxing descriptor checks,
+Stage B Parts 2 and 3 (`unsigned-paas` `ExternalSecret` + `StatefulSet`) MUST
+stage both secrets into a memory `emptyDir` via an `initContainer`:
+
+- **Volumes:**
+  - `secret-src`: Kubernetes `Secret` populated by `ExternalSecret`
+    (`defaultMode: 0440`, readable by GID `65532` under Pod `fsGroup: 65532`),
+    mounted read-only **only** into the `initContainer` at
+    `/var/run/secrets/littleman-src`.
+  - `secret-run`: `emptyDir: { medium: Memory, sizeLimit: 1Mi }`, mounted
+    read-write at `/run/littleman` in the `initContainer` and read-only at
+    `/run/littleman` in the `lg pool` container. (Kubernetes `fsGroup` does not
+    widen explicit `chmod 0600` mode bits set by a running container inside an
+    `emptyDir`.)
+- **`initContainer` (`stage-secrets`):** Uses the same digest-pinned
+  `harbor.unsigned.gg/platform/littleguy@sha256:...` image with
+  `securityContext: { runAsUser: 65532, runAsGroup: 65532, runAsNonRoot: true, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }`
+  and runs `/usr/bin/install` twice (or one per secret key) with `-m 0600` so
+  `/run/littleman/token` and `/run/littleman/llm-key` are regular files,
+  non-symlinks, mode `0600`, and owned by `65532:65532`.
+- **Main container (`lg-pool`):** Passes `--token-file /run/littleman/token` and
+  `--api-key-file /run/littleman/llm-key` with no secret environment variables.
 
 ## Requirements
 
@@ -134,8 +176,17 @@ a minimal non-root `initContainer` using the same `littleguy` image
 - **REQ-LG-CONT-03:** `cargo xtask container-check` (wired into `cargo xtask ci`),
   `.github/workflows/ci.yml` (`container` job), and
   `.github/workflows/build-image.yml` shall enforce container, workflow, Trivy,
-  and Cosign supply-chain invariants while skipping the Harbor `publish` job
-  cleanly whenever Harbor or Cosign repository secrets are absent.
+  and Cosign supply-chain invariants, restrict `workflow_run` triggers to
+  same-repository `push` events on `main` verified as ancestors of `origin/main`,
+  pass Harbor preflight credentials via a `0600` `--netrc-file` rather than
+  `curl -u` `argv`, and skip the Harbor `publish` job cleanly whenever Harbor or
+  Cosign repository secrets are absent.
+- **REQ-LG-CONT-04:** Stage B Kubernetes manifests in `unsigned-paas` (Parts 2
+  and 3) shall stage `ExternalSecret`-backed `token` and `llm-key` files into an
+  in-memory `emptyDir` (`/run/littleman`) as regular `0600` files owned by UID
+  `65532` via a non-root `initContainer` using `/usr/bin/install -m 0600`,
+  preserving `O_NOFOLLOW`, `0600`, and `geteuid()` enforcement in `PoolToken`
+  and `SecretFile`.
 
 ## Verification
 

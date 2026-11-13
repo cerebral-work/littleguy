@@ -131,6 +131,13 @@ fn check_build_image_workflow(build_image_yml: &str) -> Result<()> {
     if build_image_yml.contains(":latest") {
         bail!(".github/workflows/build-image.yml must never tag or pull `:latest`");
     }
+    let curl_argv_auth = Regex::new(r"(?m)\bcurl\b[^\n]*(\s-u\b|\s--user\b)")
+        .context("compile curl argv auth regex")?;
+    if curl_argv_auth.is_match(build_image_yml) {
+        bail!(
+            ".github/workflows/build-image.yml must not pass credentials via `curl -u` / `--user` argv; use `--netrc-file`"
+        );
+    }
     for needle in [
         "harbor.unsigned.gg",
         "platform/littleguy",
@@ -138,7 +145,11 @@ fn check_build_image_workflow(build_image_yml: &str) -> Result<()> {
         "HARBOR_PLATFORM_PUSH_PASSWORD",
         "COSIGN_PRIVATE_KEY",
         "COSIGN_PASSWORD",
+        "github.event.workflow_run.event == 'push'",
+        "github.event.workflow_run.head_repository.full_name == github.repository",
         "if: needs.preflight.outputs.ready == 'true'",
+        "git merge-base --is-ancestor",
+        "--netrc-file",
         "trivy image",
         "--ignore-unfixed --exit-code 1",
         "cosign sign",
@@ -183,6 +194,7 @@ jobs:
     const VALID_BUILD_IMAGE_YML: &str = "\
 jobs:
   preflight:
+    if: github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
     steps:
       - env:
           U: ${{ secrets.HARBOR_PLATFORM_PUSH_USERNAME }}
@@ -194,6 +206,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: |
+          git merge-base --is-ancestor \"$TARGET_SHA\" refs/remotes/origin/main
+          curl -s --netrc-file \"$netrc\" https://harbor.unsigned.gg/v2/platform/littleguy/tags/list
           ref=harbor.unsigned.gg/platform/littleguy:git-1234567
           trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \"$ref\"
           cosign sign --tlog-upload=false \"$ref\"
@@ -250,7 +264,10 @@ jobs:
             )
             .is_err()
         );
+    }
 
+    #[test]
+    fn synthetic_workflow_violations_fail() {
         let unpinned_action = VALID_CI_YML.replace(
             "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
             "actions/checkout@v4",
@@ -285,6 +302,34 @@ jobs:
                 VALID_DOCKERIGNORE,
                 VALID_CI_YML,
                 &no_skip_guard
+            )
+            .is_err()
+        );
+
+        let no_fork_guard = VALID_BUILD_IMAGE_YML.replace(
+            "github.event.workflow_run.head_repository.full_name == github.repository",
+            "true",
+        );
+        assert!(
+            check_contents(
+                VALID_DOCKERFILE,
+                VALID_DOCKERIGNORE,
+                VALID_CI_YML,
+                &no_fork_guard
+            )
+            .is_err()
+        );
+
+        let curl_argv_secret = VALID_BUILD_IMAGE_YML.replace(
+            "curl -s --netrc-file \"$netrc\"",
+            "curl -s -u \"$U:$P\" --netrc-file \"$netrc\"",
+        );
+        assert!(
+            check_contents(
+                VALID_DOCKERFILE,
+                VALID_DOCKERIGNORE,
+                VALID_CI_YML,
+                &curl_argv_secret
             )
             .is_err()
         );
