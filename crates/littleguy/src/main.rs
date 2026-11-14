@@ -40,8 +40,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use autumn_harvest_agent::AgentModel;
 use clap::{Parser, Subcommand, ValueEnum};
-use littleguy::pool::{self, PoolClient, PoolConfig, PoolToken, PoolWorker, RuntimeTurnRunner};
+use littleguy::pool::{
+    self, PoolClient, PoolConfig, PoolToken, PoolWakeSource, PoolWorker, RuntimeTurnRunner,
+};
 use littleguy::secret_file::SecretFile;
+use littleguy::wake::{WakeListener, default_lane_wake_socket};
 use littleguy_channels::{DiscordRest, SlackApi, discord, slack};
 use littleguy_core::{Config, OwnerName, PoolPeerId, RoleName, ShellId};
 use littleguy_models::{ClaudeModel, OfflineModel, OpenAiModel, Provider};
@@ -167,6 +170,9 @@ struct ServeArgs {
     /// Overrides `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `OPENROUTER_API_KEY`.
     #[arg(long, env = "LG_API_KEY_FILE")]
     api_key_file: Option<PathBuf>,
+    /// Local Unix socket path for Cortex `lane-wake` notifications (`specs/0007`).
+    #[arg(long, env = "LG_WAKE_SOCKET")]
+    wake_socket: Option<PathBuf>,
     /// The Messages API endpoint. For tests.
     #[arg(long, env = "LG_CLAUDE_ENDPOINT", hide = true)]
     claude_endpoint: Option<String>,
@@ -216,6 +222,16 @@ struct PoolArgs {
     /// Registered Cortex role for this pool worker.
     #[arg(long, env = "LG_POOL_ROLE", default_value = pool::DEFAULT_MEMBER_ROLE)]
     role: RoleName,
+    /// Subscribe to `GET /v1/mesh/pool/wake` SSE push notifications on Cortex.
+    #[arg(long, env = "LG_POOL_WAKE_CHANNEL", default_value_t = false)]
+    wake_channel: bool,
+    /// Safety reconciliation poll interval in milliseconds while parked on a live wake channel.
+    #[arg(
+        long,
+        env = "LG_POOL_WAKE_FALLBACK_MS",
+        default_value_t = pool::DEFAULT_WAKE_FALLBACK_MS
+    )]
+    wake_fallback_ms: u32,
     #[command(flatten)]
     serve: ServeArgs,
 }
@@ -337,8 +353,38 @@ fn slack_link(args: &ServeArgs, key: impl Fn(&str) -> Option<String>) -> Option<
     }
 }
 
+fn resolve_serve_wake_socket(
+    args: &ServeArgs,
+    config: &Config,
+    env: &Env,
+    var: impl Fn(&str) -> Option<String>,
+) -> Result<Option<PathBuf>> {
+    if let Some(path) = &args.wake_socket {
+        return Ok(Some(path.clone()));
+    }
+    if !config.cortex.wake {
+        return Ok(None);
+    }
+    if let Some(path) = &config.cortex.wake_socket {
+        return Ok(Some(path.clone()));
+    }
+    let state_dir = var("CORTEX_STATE_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let session = var("HERDR_SESSION");
+    let pane_id = var("HERDR_PANE_ID");
+    Ok(Some(default_lane_wake_socket(
+        state_dir.as_deref(),
+        env.home.as_deref(),
+        session.as_deref(),
+        pane_id.as_deref(),
+    )?))
+}
+
 async fn serve(socket: PathBuf, args: ServeArgs, env: &Env) -> Result<()> {
     let config = load_config(args.config.as_deref(), env)?;
+    let wake_path =
+        resolve_serve_wake_socket(&args, &config, env, |name| std::env::var(name).ok())?;
     let db = match args.db.clone() {
         Some(db) => db,
         None => env.db()?,
@@ -392,6 +438,10 @@ async fn serve(socket: PathBuf, args: ServeArgs, env: &Env) -> Result<()> {
         daemon = daemon.with_connections(started);
     }
     let listener = daemon::bind(&socket).await?;
+    let wake_listener = match &wake_path {
+        Some(path) => Some(WakeListener::bind_for_uid(path, uid).await?),
+        None => None,
+    };
     let stop = async {
         // A failed signal handler leaves only a kill to stop the daemon.
         if tokio::signal::ctrl_c().await.is_err() {
@@ -403,7 +453,12 @@ async fn serve(socket: PathBuf, args: ServeArgs, env: &Env) -> Result<()> {
     } else {
         Some(camel::Camel::start(daemon.camel_mapper(&config), &db).await?)
     };
-    daemon::run(daemon, listener, links, camel, stop).await?;
+    match wake_listener {
+        Some(wake) => {
+            daemon::run_with_wake(daemon, listener, Some(wake), links, camel, stop).await?;
+        }
+        None => daemon::run(daemon, listener, links, camel, stop).await?,
+    }
     // The socket file goes with the daemon. A crash leaves it, and the next
     // start replaces it.
     let _ = std::fs::remove_file(&socket);
@@ -418,6 +473,11 @@ async fn run_pool(args: PoolArgs, env: &Env) -> Result<()> {
         None => env.db()?,
     };
     let model = build_model(&args.serve, &db, |var| std::env::var(var).ok())?;
+    let wake_socket = args.serve.wake_socket.clone().or_else(|| {
+        std::env::var_os("LG_POOL_WAKE_SOCKET")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    });
     let pool_cfg = PoolConfig {
         cortex_url: args.cortex_url,
         token,
@@ -430,13 +490,40 @@ async fn run_pool(args: PoolArgs, env: &Env) -> Result<()> {
     };
     let client = PoolClient::new(&pool_cfg)?;
     let runner = RuntimeTurnRunner::open(&db, &config, model, args.shell_id)?;
-    let mut worker = PoolWorker::new(pool_cfg, client, runner);
+    let mut worker = PoolWorker::new(pool_cfg.clone(), client, runner);
     let stop = async {
         if tokio::signal::ctrl_c().await.is_err() {
             std::future::pending::<()>().await;
         }
     };
-    worker.run_until(stop).await?;
+    if wake_socket.is_none() && !args.wake_channel {
+        worker.run_until(stop).await?;
+        return Ok(());
+    }
+    let wake_listener = match &wake_socket {
+        Some(path) => Some(WakeListener::bind(path).await?),
+        None => None,
+    };
+    let wake_source = PoolWakeSource::new(wake_listener.is_some());
+    let mut bg_tasks = Vec::new();
+    if let Some(listener) = wake_listener {
+        let notify = wake_source.notify_handle();
+        bg_tasks.push(tokio::spawn(async move {
+            listener
+                .notify_until(notify, std::future::pending::<()>())
+                .await;
+        }));
+    }
+    if args.wake_channel {
+        bg_tasks.push(wake_source.spawn_sse_listener(&pool_cfg, std::future::pending::<()>())?);
+    }
+    let result = worker
+        .run_until_with_wake(&wake_source, args.wake_fallback_ms, stop)
+        .await;
+    for task in bg_tasks {
+        task.abort();
+    }
+    result?;
     Ok(())
 }
 
@@ -841,6 +928,78 @@ mod tests {
         match cli.command {
             Command::Pool(pool_args) => {
                 assert_eq!(pool_args.serve.api_key_file, Some(key_path));
+                assert!(!pool_args.wake_channel);
+                assert_eq!(pool_args.wake_fallback_ms, pool::DEFAULT_WAKE_FALLBACK_MS);
+            }
+            _ => panic!("expected pool command"),
+        }
+    }
+
+    #[test]
+    fn wake_socket_precedence_and_pool_wake_flags_parse() {
+        let mut config = Config::parse("owner = \"mark\"\n").unwrap();
+        let env = Env {
+            home: Some(PathBuf::from("/home/mark")),
+            ..Env::default()
+        };
+        let args = serve_args(&["lg", "serve"]);
+        assert_eq!(
+            resolve_serve_wake_socket(&args, &config, &env, |_| None).unwrap(),
+            None
+        );
+
+        config.cortex.wake = true;
+        let derived = resolve_serve_wake_socket(&args, &config, &env, |name| match name {
+            "HERDR_SESSION" => Some(String::from("estate")),
+            "HERDR_PANE_ID" => Some(String::from("w5Z:pG")),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(
+            derived,
+            Some(PathBuf::from(
+                "/home/mark/.cortex/lane-wake/estate-w5Z-pG.sock"
+            ))
+        );
+
+        config.cortex.wake_socket = Some(PathBuf::from("/tmp/from-config.sock"));
+        assert_eq!(
+            resolve_serve_wake_socket(&args, &config, &env, |_| None).unwrap(),
+            Some(PathBuf::from("/tmp/from-config.sock"))
+        );
+
+        let flag_args = serve_args(&["lg", "serve", "--wake-socket", "/tmp/from-flag.sock"]);
+        assert_eq!(
+            resolve_serve_wake_socket(&flag_args, &config, &env, |_| None).unwrap(),
+            Some(PathBuf::from("/tmp/from-flag.sock"))
+        );
+
+        let cli = Cli::try_parse_from([
+            "lg",
+            "pool",
+            "--cortex-url",
+            "http://127.0.0.1:9999",
+            "--token-file",
+            "/tmp/token",
+            "--peer-id",
+            "11111111-1111-1111-1111-111111111111",
+            "--shell-id",
+            "shell-01",
+            "--wake-socket",
+            "/tmp/pool-wake.sock",
+            "--wake-channel",
+            "--wake-fallback-ms",
+            "45000",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Pool(pool_args) => {
+                assert_eq!(
+                    pool_args.serve.wake_socket,
+                    Some(PathBuf::from("/tmp/pool-wake.sock"))
+                );
+                assert!(pool_args.wake_channel);
+                assert_eq!(pool_args.wake_fallback_ms, 45_000);
             }
             _ => panic!("expected pool command"),
         }

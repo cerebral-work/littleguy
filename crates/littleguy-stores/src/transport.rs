@@ -326,6 +326,106 @@ impl ReqwestHttpTransport {
         install_ring_tls();
         Self { client }
     }
+
+    /// Builds a [`ReqwestHttpTransport`] configured with a per-read idle timeout for SSE streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::Transport`] if `reqwest::Client::builder` fails.
+    pub fn new_streaming(read_timeout: Duration) -> Result<Self, AdapterError> {
+        install_ring_tls();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(read_timeout)
+            .build()
+            .map_err(|err| AdapterError::Transport {
+                message: err.to_string(),
+            })?;
+        Ok(Self { client })
+    }
+
+    /// Streams newline-delimited SSE lines from `url` until EOF, `on_line` returns `false`,
+    /// or an HTTP/transport error occurs.
+    ///
+    /// Lines exceeding `max_line_bytes` are discarded up to the next `\n` so an oversized frame
+    /// cannot exhaust process memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::HttpStatus`] on non-2xx responses and [`AdapterError::Transport`]
+    /// on connection or chunk read errors.
+    pub async fn stream_sse_lines(
+        &self,
+        url: Url,
+        headers: Vec<(String, String)>,
+        max_line_bytes: usize,
+        on_connected: &(dyn Fn() + Send + Sync),
+        on_line: &(dyn Fn(&str) -> bool + Send + Sync),
+    ) -> Result<(), AdapterError> {
+        let mut builder = self
+            .client
+            .get(url.clone())
+            .header("Accept", "text/event-stream");
+        for (name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        let mut response = builder
+            .send()
+            .await
+            .map_err(|err| AdapterError::Transport {
+                message: err.to_string(),
+            })?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let body = response
+                .bytes()
+                .await
+                .map(|b| String::from_utf8_lossy(&b).chars().take(256).collect())
+                .unwrap_or_default();
+            return Err(AdapterError::HttpStatus {
+                status,
+                url: url.to_string(),
+                body,
+            });
+        }
+        on_connected();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut discarding = false;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|err| AdapterError::Transport {
+                message: err.to_string(),
+            })?
+        {
+            for &byte in &chunk {
+                if byte == b'\n' {
+                    if discarding {
+                        discarding = false;
+                        buf.clear();
+                        continue;
+                    }
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                    let line = String::from_utf8_lossy(&buf);
+                    let keep_going = on_line(&line);
+                    buf.clear();
+                    if !keep_going {
+                        return Ok(());
+                    }
+                } else if !discarding {
+                    if buf.len() >= max_line_bytes {
+                        discarding = true;
+                        buf.clear();
+                    } else {
+                        buf.push(byte);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl HttpTransport for ReqwestHttpTransport {

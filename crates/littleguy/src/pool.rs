@@ -5,6 +5,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use autumn_harvest_agent::model::BoxFuture;
@@ -22,8 +23,10 @@ use littleguy_stores::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+use tokio::sync::Notify;
 
 use crate::secret_file::{SecretFile, SecretFileError};
+use crate::wake::MAX_WAKE_LINE_BYTES;
 
 /// Default allowed sender role on Cortex (`escapement-serve` pool publisher).
 pub const DEFAULT_ALLOWED_SENDER: &str = "service-escapement-pool";
@@ -35,6 +38,12 @@ pub const DEFAULT_WAIT_MS: u32 = 5_000;
 pub const MIN_IDLE_POLL_FLOOR: Duration = Duration::from_millis(250);
 /// Default redelivery delay in milliseconds for `/v1/mesh/pool/nack`.
 pub const DEFAULT_NACK_DELAY_MS: u32 = 5_000;
+/// Default safety reconciliation poll interval in milliseconds while parked on a live wake channel (`specs/0007`).
+pub const DEFAULT_WAKE_FALLBACK_MS: u32 = 60_000;
+/// Minimum reconciliation poll interval in milliseconds so tiny `--wake-fallback-ms` values never spin.
+pub const MIN_WAKE_FALLBACK_MS: u32 = 250;
+/// Per-read socket idle timeout on `GET /v1/mesh/pool/wake` SSE connections.
+pub const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 /// Maximum size in bytes of the `--token-file` read (`REQ-LG-POOL-01`).
 pub const MAX_TOKEN_FILE_BYTES: usize = 4 * 1024;
 /// Maximum inbound delivery body bytes (`escapement-serve/src/pool.rs:44` `POOL_BODY_MAX`).
@@ -339,6 +348,152 @@ impl PoolClient {
             .await
             .map(|_| ())
     }
+}
+
+/// Shared wake state uniting a local Unix `WakeListener` and/or a Cortex `/v1/mesh/pool/wake` SSE stream (`specs/0007`).
+#[derive(Debug, Clone)]
+pub struct PoolWakeSource {
+    notify: Arc<Notify>,
+    has_local_socket: bool,
+    sse_live: Arc<AtomicBool>,
+}
+
+impl PoolWakeSource {
+    /// Creates a wake source; `has_local_socket` marks whether a bound [`crate::wake::WakeListener`] feeds it.
+    #[must_use]
+    pub fn new(has_local_socket: bool) -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            has_local_socket,
+            sse_live: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Returns the shared [`Notify`] handle signaled whenever work may be ready.
+    #[must_use]
+    pub fn notify_handle(&self) -> Arc<Notify> {
+        Arc::clone(&self.notify)
+    }
+
+    /// Signals one waiting worker pass immediately.
+    pub fn trigger(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Returns `true` while at least one push wake channel (local Unix socket or live SSE stream) is active.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.has_local_socket || self.sse_live.load(Ordering::Acquire)
+    }
+
+    /// Spawns a background SSE subscriber against `GET <cortex_url>/v1/mesh/pool/wake?peer_id=<peer_id>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError`] when `cfg.cortex_url` is malformed or the streaming HTTP client fails to initialize.
+    pub fn spawn_sse_listener(
+        &self,
+        cfg: &PoolConfig,
+        stop: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<tokio::task::JoinHandle<()>, PoolError> {
+        Self::spawn_sse_listener_with_timeout(self, cfg, SSE_IDLE_TIMEOUT, stop)
+    }
+
+    /// Spawns the SSE subscriber with a custom per-read idle timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError`] when `cfg.cortex_url` is malformed or the streaming HTTP client fails to initialize.
+    pub fn spawn_sse_listener_with_timeout(
+        &self,
+        cfg: &PoolConfig,
+        idle_timeout: Duration,
+        stop: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<tokio::task::JoinHandle<()>, PoolError> {
+        let base = parse_clean_base_url(&cfg.cortex_url, "cortex_url")
+            .map_err(|e| PoolError::InvalidUrl(e.to_string()))?;
+        let mut url = join_url_segments(&base, &["v1", "mesh", "pool", "wake"])
+            .map_err(|e| PoolError::InvalidUrl(e.to_string()))?;
+        url.query_pairs_mut()
+            .append_pair("peer_id", cfg.peer_id.as_str());
+        let transport =
+            ReqwestHttpTransport::new_streaming(idle_timeout).map_err(map_adapter_err)?;
+        let auth_value = format!("Bearer {}", cfg.token.0);
+        let notify = Arc::clone(&self.notify);
+        let sse_live = Arc::clone(&self.sse_live);
+        Ok(tokio::spawn(async move {
+            tokio::pin!(stop);
+            let mut unsupported_logged = false;
+            let mut backoff_secs = 1_u64;
+            loop {
+                let notify_conn = Arc::clone(&notify);
+                let live_conn = Arc::clone(&sse_live);
+                let on_connected = move || {
+                    backoff_secs_reset(&live_conn, &notify_conn);
+                };
+                let notify_line = Arc::clone(&notify);
+                let on_line = move |line: &str| -> bool {
+                    if line.starts_with("event: wake") || line.starts_with("data:") {
+                        notify_line.notify_one();
+                    }
+                    true
+                };
+                let headers = vec![(String::from("Authorization"), auth_value.clone())];
+                let res = tokio::select! {
+                    () = &mut stop => break,
+                    r = transport.stream_sse_lines(
+                        url.clone(),
+                        headers,
+                        MAX_WAKE_LINE_BYTES,
+                        &on_connected,
+                        &on_line,
+                    ) => r,
+                };
+                let was_live = sse_live.swap(false, Ordering::Release);
+                if was_live {
+                    backoff_secs = 1;
+                }
+                // Wake the worker so it switches to standard polling if no local socket is active.
+                notify.notify_one();
+                let sleep_dur = match res {
+                    Ok(()) => Duration::from_millis(250),
+                    Err(AdapterError::HttpStatus {
+                        status: 404 | 405, ..
+                    }) => {
+                        if !unsupported_logged {
+                            unsupported_logged = true;
+                            tracing::info!(
+                                "cortex server does not expose /v1/mesh/pool/wake yet; falling back to recv long-poll"
+                            );
+                        }
+                        Duration::from_secs(30)
+                    }
+                    Err(AdapterError::HttpStatus {
+                        status: 401 | 403, ..
+                    }) => break,
+                    Err(err) => {
+                        let wait = Duration::from_secs(backoff_secs);
+                        backoff_secs = (backoff_secs.saturating_mul(2)).min(15);
+                        tracing::debug!(
+                            reason = %truncate_chars(&err.to_string(), 200),
+                            "pool wake SSE stream disconnected; reconnecting"
+                        );
+                        wait
+                    }
+                };
+                tokio::select! {
+                    () = &mut stop => break,
+                    () = tokio::time::sleep(sleep_dur) => {}
+                }
+            }
+            sse_live.store(false, Ordering::Release);
+        }))
+    }
+}
+
+fn backoff_secs_reset(sse_live: &AtomicBool, notify: &Notify) {
+    sse_live.store(true, Ordering::Release);
+    notify.notify_one();
 }
 
 fn map_adapter_err(err: AdapterError) -> PoolError {
@@ -684,7 +839,7 @@ impl<R: TurnRunner> PoolWorker<R> {
         }
     }
 
-    /// Polls Cortex once (`free_slots: 1`) and processes any returned delivery.
+    /// Polls Cortex once (`free_slots: 1`) using `config.wait_ms` and processes any returned delivery.
     ///
     /// Per-delivery poison tokens, malformed payloads, and settle or send HTTP errors
     /// are logged and settled (or skipped so the lease expires) without failing `step`.
@@ -693,10 +848,16 @@ impl<R: TurnRunner> PoolWorker<R> {
     ///
     /// Returns [`PoolError`] only when `/v1/mesh/pool/recv` fails.
     pub async fn step(&mut self) -> Result<StepOutcome, PoolError> {
-        let batch = self
-            .client
-            .recv(&self.config.peer_id, self.config.wait_ms)
-            .await?;
+        self.step_with_wait(self.config.wait_ms).await
+    }
+
+    /// Polls Cortex once (`free_slots: 1`) with an explicit `wait_ms` override.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError`] only when `/v1/mesh/pool/recv` fails.
+    pub async fn step_with_wait(&mut self, wait_ms: u32) -> Result<StepOutcome, PoolError> {
+        let batch = self.client.recv(&self.config.peer_id, wait_ms).await?;
         let Some(item) = batch.into_iter().next() else {
             return Ok(StepOutcome::Idle);
         };
@@ -782,6 +943,73 @@ impl<R: TurnRunner> PoolWorker<R> {
                         );
                         tokio::select! {
                             () = &mut stop => return Ok(()),
+                            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs the worker under channel-based wake (`REQ-LG-WAKE-05`).
+    ///
+    /// While `wake.is_live()` holds, ready deliveries drain with `wait_ms = 0` and idle cycles
+    /// park on `wake` or `fallback_poll_ms` (floored at [`MIN_WAKE_FALLBACK_MS`]) without blind
+    /// polling. When no wake channel is live, the loop falls back seamlessly to `config.wait_ms`
+    /// long-polling with [`MIN_IDLE_POLL_FLOOR`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates startup/configuration or `/v1/mesh/pool/recv` `401`/`403` [`PoolError`] failures.
+    pub async fn run_until_with_wake(
+        &mut self,
+        wake: &PoolWakeSource,
+        fallback_poll_ms: u32,
+        stop: impl Future<Output = ()> + Send,
+    ) -> Result<(), PoolError> {
+        let fallback_poll = Duration::from_millis(u64::from(fallback_poll_ms))
+            .max(Duration::from_millis(u64::from(MIN_WAKE_FALLBACK_MS)));
+        tokio::pin!(stop);
+        loop {
+            let notified = wake.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let live = wake.is_live();
+            let wait_ms = if live { 0 } else { self.config.wait_ms };
+            let poll_start = tokio::time::Instant::now();
+
+            tokio::select! {
+                () = &mut stop => return Ok(()),
+                res = self.step_with_wait(wait_ms) => match res {
+                    Ok(StepOutcome::Idle) => {
+                        if wake.is_live() {
+                            tokio::select! {
+                                () = &mut stop => return Ok(()),
+                                () = &mut notified => {}
+                                () = tokio::time::sleep(fallback_poll) => {}
+                            }
+                        } else {
+                            let elapsed = poll_start.elapsed();
+                            if let Some(rem) = MIN_IDLE_POLL_FLOOR.checked_sub(elapsed) {
+                                tokio::select! {
+                                    () = &mut stop => return Ok(()),
+                                    () = &mut notified => {}
+                                    () = tokio::time::sleep(rem) => {}
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.is_recv_fatal() => return Err(err),
+                    Err(err) => {
+                        tracing::warn!(
+                            reason = %truncate_chars(&err.to_string(), 256),
+                            "pool poll error; backing off"
+                        );
+                        tokio::select! {
+                            () = &mut stop => return Ok(()),
+                            () = &mut notified => {}
                             () = tokio::time::sleep(Duration::from_secs(1)) => {}
                         }
                     }

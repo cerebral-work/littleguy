@@ -222,6 +222,9 @@ pub enum ConfigError {
     /// The Google section is not valid.
     #[error("the google section is not valid: {0}")]
     Google(String),
+    /// The Cortex section is not valid.
+    #[error("the cortex section is not valid: {0}")]
+    Cortex(String),
     /// A camel route reads from a component that littleguy does not run.
     #[error("camel route `{id}` reads from `{from}`: use one of {}", CAMEL_SCHEMES.join(", "))]
     CamelScheme {
@@ -885,7 +888,43 @@ struct Raw {
     #[serde(default)]
     flow: RawFlow,
     #[serde(default)]
+    cortex: RawCortex,
+    #[serde(default)]
     mcp: RawMcp,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCortex {
+    wake: Option<bool>,
+    wake_socket: Option<String>,
+}
+
+/// The Cortex mesh wake settings of `lg serve` (`specs/0007`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CortexConfig {
+    /// Listen on the `lane-wake` Unix socket for `cortex-edge` channel wakes.
+    pub wake: bool,
+    /// Explicit Unix socket path override; when `None` and `wake` is `true`,
+    /// `lg serve` derives `${CORTEX_STATE_DIR:-$HOME/.cortex}/lane-wake/<safe_pane>.sock`
+    /// from `HERDR_SESSION` and `HERDR_PANE_ID`.
+    pub wake_socket: Option<PathBuf>,
+}
+
+fn cortex(raw: RawCortex) -> Result<CortexConfig, ConfigError> {
+    let wake_socket = match raw.wake_socket {
+        Some(path) => {
+            if path.trim().is_empty() {
+                return Err(ConfigError::Cortex(String::from(
+                    "wake_socket must not be empty",
+                )));
+            }
+            Some(PathBuf::from(path))
+        }
+        None => None,
+    };
+    let wake = raw.wake.unwrap_or_else(|| wake_socket.is_some());
+    Ok(CortexConfig { wake, wake_socket })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1161,6 +1200,8 @@ pub struct Config {
     pub approvals: ApprovalsConfig,
     /// The flow rules.
     pub flow: FlowConfig,
+    /// The Cortex mesh wake settings.
+    pub cortex: CortexConfig,
     /// The MCP servers.
     pub mcp: Vec<McpServer>,
 }
@@ -1184,6 +1225,7 @@ impl Config {
             sandbox: None,
             approvals: ApprovalsConfig::default(),
             flow: FlowConfig::default(),
+            cortex: CortexConfig::default(),
             mcp: Vec::new(),
         }
     }
@@ -1247,6 +1289,7 @@ impl Config {
                 rule_of_two: raw.flow.rule_of_two.unwrap_or(true),
                 recheck: raw.flow.recheck.unwrap_or_default(),
             },
+            cortex: cortex(raw.cortex)?,
             mcp: mcp_servers(raw.mcp.server)?,
         })
     }
@@ -1848,5 +1891,43 @@ mod tests {
     fn a_missing_file_names_its_path() {
         let error = Config::load(Path::new("/nonexistent/lg.toml")).unwrap_err();
         assert!(error.to_string().contains("/nonexistent/lg.toml"));
+    }
+
+    #[test]
+    fn the_cortex_section_is_read_and_checked() {
+        let plain = Config::parse("owner = \"mark\"").unwrap();
+        assert_eq!(plain.cortex, CortexConfig::default());
+
+        let herdr = Config::parse("owner = \"mark\"\n[cortex]\nwake = true").unwrap();
+        assert_eq!(
+            herdr.cortex,
+            CortexConfig {
+                wake: true,
+                wake_socket: None,
+            }
+        );
+
+        let socket_implies_wake =
+            Config::parse("owner = \"mark\"\n[cortex]\nwake_socket = \"/tmp/lg-wake.sock\"")
+                .unwrap();
+        assert_eq!(
+            socket_implies_wake.cortex,
+            CortexConfig {
+                wake: true,
+                wake_socket: Some(PathBuf::from("/tmp/lg-wake.sock")),
+            }
+        );
+
+        let disabled = Config::parse(
+            "owner = \"mark\"\n[cortex]\nwake = false\nwake_socket = \"/tmp/lg-wake.sock\"",
+        )
+        .unwrap();
+        assert!(!disabled.cortex.wake);
+
+        let empty_sock = Config::parse("owner = \"mark\"\n[cortex]\nwake_socket = \"   \"");
+        assert!(matches!(empty_sock, Err(ConfigError::Cortex(_))));
+
+        let unknown = Config::parse("owner = \"mark\"\n[cortex]\nunknown_key = true");
+        assert!(unknown.is_err());
     }
 }

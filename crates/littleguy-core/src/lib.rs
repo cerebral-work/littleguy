@@ -14,17 +14,17 @@ pub mod route;
 pub mod rule_of_two;
 
 pub use config::{
-    ApprovalsConfig, BriefConfig, CamelRoute, ChatConfig, Config, ConfigError, DiscordConfig,
-    FirecrackerConfig, FlowConfig, FlowRecheck, GoogleConfig, Integration, McpServer, McpTransport,
-    MemoryConfig, SanMateoConfig, SanMateoError, SandboxBackend, SandboxConfig, SlackConfig,
-    ToolsConfig, chat_user, discord_sender, slack_sender,
+    ApprovalsConfig, BriefConfig, CamelRoute, ChatConfig, Config, ConfigError, CortexConfig,
+    DiscordConfig, FirecrackerConfig, FlowConfig, FlowRecheck, GoogleConfig, Integration,
+    McpServer, McpTransport, MemoryConfig, SanMateoConfig, SanMateoError, SandboxBackend,
+    SandboxConfig, SlackConfig, ToolsConfig, chat_user, discord_sender, slack_sender,
 };
 pub use ghost_binding::{
     GhostBinding, GhostBindingError, GhostBindingWire, GhostLifecycleState, GhostManifestation,
 };
 pub use ids::{
     ChannelId, DeliveryToken, IdError, MAX_DELIVERY_TOKEN_BYTES, MessageId, OwnerName, PoolPeerId,
-    RoleName, SenderId, ShellId, TaskId,
+    RoleName, SenderId, ShellId, TaskId, WakeMessageId,
 };
 pub use mandate_bridge::{
     BiscuitMandateClaims, ConstitutionalSealedAction, ESTATE_TRUST_DOMAIN, MandateBridgeError,

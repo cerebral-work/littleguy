@@ -522,3 +522,40 @@ async fn a_slack_approver_decides_with_a_button() {
     assert_eq!(backend.runs.load(Ordering::SeqCst), 1);
     assert!(fake.posted()[2..].iter().all(|p| p.channel == "DU43"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cortex_wake_holds_during_approval_wait_and_runs_after_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(CountingBackend::default());
+    let mut daemon = open_sandboxed(
+        &dir.path().join("lg.db"),
+        &sandbox_config(None, 3600),
+        &backend,
+    );
+    let waiting = daemon
+        .handle_request(UID, request("w-1", "run echo hi"))
+        .await;
+    assert_eq!(waiting, Response::Waiting { approval: 1 });
+
+    let wake_id = WakeMessageId::new("AB570176-0000-4000-8000-000000000004").unwrap();
+    let held_resp = daemon.wake(&wake_id).await.unwrap();
+    assert_eq!(held_resp, Response::Busy { approval: 1 });
+    // Duplicate wake while waiting is queued only once.
+    let dup_held = daemon.wake(&wake_id).await.unwrap();
+    assert_eq!(dup_held, Response::Busy { approval: 1 });
+
+    let decided = daemon.handle_request(UID, Request::Approve { id: 1 }).await;
+    assert_eq!(reply_text(&decided), "ran: hi");
+    daemon.release_held().await;
+
+    let state = daemon.state().await.unwrap().unwrap();
+    assert_eq!(
+        state.last_answer.as_deref(),
+        Some(
+            "ok: New cortex mesh message ab570176-0000-4000-8000-000000000004. Read it with cortex__mesh_read."
+        )
+    );
+    // Sending the same wake UUID again deduplicates via autumn-harvest.
+    let dup_after = daemon.wake(&wake_id).await.unwrap();
+    assert!(matches!(dup_after, Response::Duplicate { .. }));
+}

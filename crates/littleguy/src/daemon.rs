@@ -34,8 +34,8 @@ use littleguy_channels::slack::{SlackEvent, SlackPress, run_socket};
 use littleguy_channels::{ChannelError, DmMessage, Service, SlackApi};
 use littleguy_core::{
     ASSISTANT_KIND, ChannelId, ChannelRule, Config, Inbound, MessageId, PairingCode, Pending,
-    PendingPairings, Route, Routing, SenderId, discord_sender, pairing::PAIRING_TTL_SECS, route,
-    slack_sender,
+    PendingPairings, Route, Routing, SenderId, WakeMessageId, discord_sender,
+    pairing::PAIRING_TTL_SECS, route, slack_sender,
 };
 use littleguy_stores::SqliteStores;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -49,9 +49,16 @@ use crate::chats::Chats;
 use crate::oauth::Connections;
 use crate::pairs::{Entry, PairStore};
 use crate::protocol::{MAX_REQUEST_BYTES, PairEntry, Request, Response};
+use littleguy::wake::{WakeListener, cortex_wake_notice};
 
 /// The channel id of the local socket.
 pub const CLI_CHANNEL: &str = "cli";
+
+/// The channel id of the Cortex mesh wake socket.
+pub const CORTEX_CHANNEL: &str = "cortex";
+
+/// The sender id of Cortex mesh wake notices.
+pub const CORTEX_SENDER: &str = "cortex:mesh";
 
 /// The sender id of `user` on `service`.
 ///
@@ -122,9 +129,15 @@ pub fn routing(
         pairing: false,
         allowed: std::iter::once(cli_sender(owner_uid)?).collect(),
     };
+    let cortex = ChannelRule {
+        enabled: true,
+        pairing: false,
+        allowed: std::iter::once(SenderId::new(CORTEX_SENDER)?).collect(),
+    };
     let mut table = Routing::new(&config.owner)
         .with_context(|| format!("`{}` is not a valid agent name", config.owner))?
-        .channel(ChannelId::new(CLI_CHANNEL)?, cli);
+        .channel(ChannelId::new(CLI_CHANNEL)?, cli)
+        .channel(ChannelId::new(CORTEX_CHANNEL)?, cortex);
     for service in chats {
         let channel = ChannelId::new(service.name())?;
         let settings = chat_config(config, *service);
@@ -284,6 +297,8 @@ pub struct Daemon {
     waiting: Option<i64>,
     /// The chat messages that arrived while a request waited.
     held: VecDeque<(Service, DmMessage)>,
+    /// The Cortex mesh wakes that arrived while a request waited.
+    held_wakes: VecDeque<WakeMessageId>,
 }
 
 /// The wall clock of the daemon. Tests set one clock for the daemon and its
@@ -442,6 +457,7 @@ impl Daemon {
             approver,
             waiting,
             held: VecDeque::new(),
+            held_wakes: VecDeque::new(),
         })
     }
 
@@ -632,6 +648,30 @@ impl Daemon {
             },
             |text| Response::Reply { text },
         ))
+    }
+
+    /// Handles one Cortex mesh wake notice. While an approval waits, the wake
+    /// sits in `held_wakes` and runs after the decision settles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime fails to record or drive the op.
+    pub async fn wake(&mut self, message_id: &WakeMessageId) -> Result<Response> {
+        if self.waiting.is_some() {
+            if !self.held_wakes.contains(message_id) {
+                self.held_wakes.push_back(message_id.clone());
+            }
+            return Ok(Response::Busy {
+                approval: self.waiting.unwrap_or_default(),
+            });
+        }
+        let inbound = Inbound {
+            channel: ChannelId::new(CORTEX_CHANNEL)?,
+            sender: SenderId::new(CORTEX_SENDER)?,
+            message_id: MessageId::new(format!("{CORTEX_CHANNEL}:{message_id}"))?,
+            text: cortex_wake_notice(message_id),
+        };
+        self.handle(&inbound, "").await
     }
 
     /// Handles one Discord direct message, as [`Self::chat`] does.
@@ -955,6 +995,11 @@ enum Job {
         press: Press,
         reply: oneshot::Sender<gate::PressAnswer>,
     },
+    /// A validated Cortex mesh wake notice from `WakeListener`.
+    Wake {
+        message_id: WakeMessageId,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// One button press, as each chat service gives it.
@@ -1051,6 +1096,17 @@ async fn run_job(daemon: &mut Daemon, job: Job) {
             }
             daemon.release_held().await;
         }
+        Job::Wake { message_id, reply } => {
+            let ok = match daemon.wake(&message_id).await {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::error!(error = %format!("{error:#}"), %message_id, "a cortex wake failed");
+                    false
+                }
+            };
+            let _ = reply.send(ok);
+            daemon.release_held().await;
+        }
     }
 }
 
@@ -1060,8 +1116,24 @@ async fn run_job(daemon: &mut Daemon, job: Job) {
 ///
 /// Returns an error only when the loop cannot start.
 pub async fn run(
+    daemon: Daemon,
+    listener: UnixListener,
+    links: Links,
+    camel: Option<Camel>,
+    stop: impl Future<Output = ()>,
+) -> Result<()> {
+    Box::pin(run_with_wake(daemon, listener, None, links, camel, stop)).await
+}
+
+/// Runs the daemon with an optional Cortex [`WakeListener`] until `stop` completes.
+///
+/// # Errors
+///
+/// Returns an error only when the loop cannot start.
+pub async fn run_with_wake(
     mut daemon: Daemon,
     listener: UnixListener,
+    wake: Option<WakeListener>,
     links: Links,
     camel: Option<Camel>,
     stop: impl Future<Output = ()>,
@@ -1070,6 +1142,30 @@ pub async fn run(
     // Without camel routes, the sender drops at once and the arm sleeps.
     let (camel_tx, mut camel_rx) = mpsc::channel::<crate::camel::Apply>(4);
     let mut tasks = vec![tokio::spawn(accept_loop(listener, tx.clone()))];
+    if let Some(wake_listener) = wake {
+        let wake_jobs = tx.clone();
+        tasks.push(tokio::spawn(async move {
+            wake_listener
+                .serve_until(
+                    move |message_id| {
+                        let wake_jobs = wake_jobs.clone();
+                        async move {
+                            let (reply, done) = oneshot::channel();
+                            if wake_jobs
+                                .send(Job::Wake { message_id, reply })
+                                .await
+                                .is_err()
+                            {
+                                return false;
+                            }
+                            done.await.unwrap_or(false)
+                        }
+                    },
+                    std::future::pending::<()>(),
+                )
+                .await;
+        }));
+    }
     if let Some(link) = links.discord {
         daemon.discord_rest(link.rest.clone());
         let (events_tx, events) = mpsc::unbounded_channel();
@@ -1107,11 +1203,11 @@ pub async fn run(
         tokio::select! {
             job = rx.recv() => {
                 let Some(job) = job else { break };
-                run_job(&mut daemon, job).await;
+                Box::pin(run_job(&mut daemon, job)).await;
             }
-            Some(apply) = camel_rx.recv() => daemon.camel(apply).await,
+            Some(apply) = camel_rx.recv() => Box::pin(daemon.camel(apply)).await,
             _ = ticker.tick() => {
-                if let Err(error) = daemon.tick().await {
+                if let Err(error) = Box::pin(daemon.tick()).await {
                     tracing::warn!(error = %format!("{error:#}"), "a tick failed");
                 }
             }

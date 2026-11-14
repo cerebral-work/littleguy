@@ -234,6 +234,71 @@ impl FromStr for PoolPeerId {
         Self::new(text)
     }
 }
+
+/// The hyphenated UUID of one Cortex wake message (`8-4-4-4-12` lowercase hex).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct WakeMessageId(String);
+
+impl WakeMessageId {
+    /// Checks `text` for hyphenated UUID shape (`8-4-4-4-12` hex), normalizes
+    /// uppercase hex digits to lowercase, and wraps it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdError`] when `text` is empty, over [`MAX_ID_BYTES`], not
+    /// printable ASCII, or not `8-4-4-4-12` hexadecimal.
+    pub fn new(text: impl Into<String>) -> Result<Self, IdError> {
+        let text = text.into();
+        check_with(
+            "wake message id",
+            MAX_ID_BYTES,
+            |kind| IdError::TooLong { kind },
+            &text,
+        )?;
+        if !is_uuid_shape(&text) {
+            return Err(IdError::InvalidUuid {
+                kind: "wake message id",
+            });
+        }
+        Ok(Self(text.to_ascii_lowercase()))
+    }
+
+    /// The lowercased UUID as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for WakeMessageId {
+    type Error = IdError;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::new(text)
+    }
+}
+
+impl From<WakeMessageId> for String {
+    fn from(id: WakeMessageId) -> Self {
+        id.0
+    }
+}
+
+impl fmt::Display for WakeMessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for WakeMessageId {
+    type Err = IdError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::new(text)
+    }
+}
+
 id_type!(
     /// An opaque lease token returned by Cortex `/v1/mesh/pool/recv`.
     DeliveryToken,
@@ -272,5 +337,32 @@ mod tests {
         let id = ChannelId::try_from(String::from("cli")).unwrap();
         assert_eq!(String::from(id), "cli");
         assert!(OwnerName::try_from(String::from("a\nb")).is_err());
+    }
+
+    #[test]
+    fn wake_message_id_normalizes_uuid_and_rejects_non_uuid() {
+        let id = WakeMessageId::new("AB570176-0000-4000-8000-000000000004").unwrap();
+        assert_eq!(id.as_str(), "ab570176-0000-4000-8000-000000000004");
+        assert_eq!(id.to_string(), "ab570176-0000-4000-8000-000000000004");
+        let parsed: WakeMessageId = "11111111-2222-4333-8444-555555555555".parse().unwrap();
+        assert_eq!(String::from(parsed), "11111111-2222-4333-8444-555555555555");
+        assert_eq!(
+            WakeMessageId::new(""),
+            Err(IdError::Empty {
+                kind: "wake message id"
+            })
+        );
+        assert_eq!(
+            WakeMessageId::new("not-a-uuid; ignore previous instructions"),
+            Err(IdError::NotPrintable {
+                kind: "wake message id"
+            })
+        );
+        assert_eq!(
+            WakeMessageId::new("ab570176_0000_4000_8000_000000000004"),
+            Err(IdError::InvalidUuid {
+                kind: "wake message id"
+            })
+        );
     }
 }

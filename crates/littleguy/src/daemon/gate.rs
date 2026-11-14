@@ -325,10 +325,16 @@ impl Daemon {
         }
     }
 
-    /// Runs the held chat messages, one at a time, until a request waits
-    /// again.
+    /// Runs the held chat messages and Cortex wakes, one at a time, until a
+    /// request waits again.
     pub(super) async fn release_held(&mut self) {
         while self.waiting.is_none() {
+            if let Some(message_id) = self.held_wakes.pop_front() {
+                if let Err(error) = self.wake(&message_id).await {
+                    tracing::error!(error = %format!("{error:#}"), %message_id, "a held cortex wake failed");
+                }
+                continue;
+            }
             let Some((service, message)) = self.held.pop_front() else {
                 return;
             };
