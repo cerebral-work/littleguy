@@ -30,6 +30,7 @@ autumn-harvest-plugin = { version = "0.10.0", default-features = false, features
 autumn-harvest-sqlite = "0.10.0"
 rusqlite = { version = "0.40", features = ["bundled"] }
 anyhow = "1"
+blake3 = "1"
 clap = { version = "4.6", features = ["derive", "env"] }
 proptest = "1"
 rustix = { version = "1", features = ["fs", "process"] }

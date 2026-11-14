@@ -51,6 +51,7 @@ pub use transport::{
     MockRouteHandler, ReqwestHttpTransport, StoreHttpRequest, StoreHttpResponse, join_url_segments,
     parse_clean_base_url,
 };
+pub use url::Url;
 pub use xerj::{
     CYGNUS_XERJ_DEFAULT_URL, CommitWatermark, DEFAULT_PASSAGE_FIELD, MIN_XERJ_MAX_TOKENS,
     WatermarkDriftReason, WatermarkSyncDecision, XerjClientConfig, XerjEmbedMode,

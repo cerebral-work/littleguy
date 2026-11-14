@@ -37,16 +37,21 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use autumn_harvest_agent::AgentModel;
+use anyhow::{Context, Result, bail};
+use autumn_harvest_agent::{AgentModel, ToolPolicy};
 use clap::{Parser, Subcommand, ValueEnum};
+use littleguy::custody::{self, BlackwallCustodyClient};
 use littleguy::pool::{
-    self, PoolClient, PoolConfig, PoolToken, PoolWakeSource, PoolWorker, RuntimeTurnRunner,
+    self, PoolClient, PoolConfig, PoolToken, PoolWakeSource, PoolWorker, RuntimeTurnOptions,
+    RuntimeTurnRunner,
 };
+use littleguy::reflex_gate::{ReflexClassifyClient, ReflexToolPolicy};
 use littleguy::secret_file::SecretFile;
 use littleguy::wake::{WakeListener, default_lane_wake_socket};
 use littleguy_channels::{DiscordRest, SlackApi, discord, slack};
-use littleguy_core::{Config, OwnerName, PoolPeerId, RoleName, ShellId};
+use littleguy_core::{
+    ASSISTANT_KIND, BlackwallProject, Config, OwnerName, PoolPeerId, RoleName, ShellId,
+};
 use littleguy_models::{ClaudeModel, OfflineModel, OpenAiModel, Provider};
 
 use crate::paths::Env;
@@ -66,7 +71,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the daemon.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Send one message and print the answer.
     Chat(ChatArgs),
     /// Let the stranger who got `code` talk to the assistant.
@@ -111,7 +116,7 @@ enum Command {
         reason: Option<String>,
     },
     /// Pull littleman tasks from a Cortex pool and run one turn per task.
-    Pool(PoolArgs),
+    Pool(Box<PoolArgs>),
 }
 
 /// The models that `lg serve` can run.
@@ -173,6 +178,9 @@ struct ServeArgs {
     /// Local Unix socket path for Cortex `lane-wake` notifications (`specs/0007`).
     #[arg(long, env = "LG_WAKE_SOCKET")]
     wake_socket: Option<PathBuf>,
+    /// Optional `reflexd` base URL or `/v1/classify` endpoint (`specs/0008`).
+    #[arg(long, env = "LG_REFLEX_CLASSIFY_URL")]
+    reflex_classify_url: Option<String>,
     /// The Messages API endpoint. For tests.
     #[arg(long, env = "LG_CLAUDE_ENDPOINT", hide = true)]
     claude_endpoint: Option<String>,
@@ -232,6 +240,19 @@ struct PoolArgs {
         default_value_t = pool::DEFAULT_WAKE_FALLBACK_MS
     )]
     wake_fallback_ms: u32,
+    /// Optional `blackwall-serve` base URL for custody bundle imports (`specs/0008`).
+    #[arg(long, env = "LG_BLACKWALL_URL")]
+    blackwall_url: Option<String>,
+    /// Regular `0600` file owned by the current user holding the Blackwall bearer token (`specs/0008`).
+    #[arg(long, env = "LG_BLACKWALL_TOKEN_FILE")]
+    blackwall_token_file: Option<PathBuf>,
+    /// Default 1- or 2-segment Blackwall project slug (`specs/0008`).
+    #[arg(
+        long,
+        env = "LG_BLACKWALL_PROJECT",
+        default_value = custody::DEFAULT_BLACKWALL_PROJECT
+    )]
+    blackwall_project: BlackwallProject,
     #[command(flatten)]
     serve: ServeArgs,
 }
@@ -381,7 +402,33 @@ fn resolve_serve_wake_socket(
     )?))
 }
 
+fn resolve_reflex_client(args: &ServeArgs) -> Result<Option<ReflexClassifyClient>> {
+    args.reflex_classify_url
+        .as_deref()
+        .map(ReflexClassifyClient::new)
+        .transpose()
+        .context("invalid --reflex-classify-url")
+}
+
+fn resolve_blackwall_custody(args: &PoolArgs) -> Result<Option<BlackwallCustodyClient>> {
+    match (&args.blackwall_url, &args.blackwall_token_file) {
+        (None, None) => Ok(None),
+        (Some(_), None) => bail!(
+            "--blackwall-token-file (or LG_BLACKWALL_TOKEN_FILE) is required when --blackwall-url is set"
+        ),
+        (None, Some(_)) => bail!(
+            "--blackwall-url (or LG_BLACKWALL_URL) is required when --blackwall-token-file is set"
+        ),
+        (Some(url), Some(token_path)) => Ok(Some(BlackwallCustodyClient::open(
+            url,
+            token_path,
+            args.blackwall_project.clone(),
+        )?)),
+    }
+}
+
 async fn serve(socket: PathBuf, args: ServeArgs, env: &Env) -> Result<()> {
+    let reflex = resolve_reflex_client(&args)?;
     let config = load_config(args.config.as_deref(), env)?;
     let wake_path =
         resolve_serve_wake_socket(&args, &config, env, |name| std::env::var(name).ok())?;
@@ -431,6 +478,7 @@ async fn serve(socket: PathBuf, args: ServeArgs, env: &Env) -> Result<()> {
         mcp,
         google,
         slack: links.slack.is_some(),
+        reflex,
     };
     let discord = links.discord.is_some();
     let mut daemon = daemon::Daemon::open_with(&db, &config, model, uid, discord, extras)?;
@@ -466,6 +514,8 @@ async fn serve(socket: PathBuf, args: ServeArgs, env: &Env) -> Result<()> {
 }
 
 async fn run_pool(args: PoolArgs, env: &Env) -> Result<()> {
+    let reflex = resolve_reflex_client(&args.serve)?;
+    let custody = resolve_blackwall_custody(&args)?;
     let token = PoolToken::load(&args.token_file)?;
     let config = load_config(args.serve.config.as_deref(), env)?;
     let db = match args.serve.db.clone() {
@@ -489,7 +539,30 @@ async fn run_pool(args: PoolArgs, env: &Env) -> Result<()> {
         shell_id: args.shell_id.clone(),
     };
     let client = PoolClient::new(&pool_cfg)?;
-    let runner = RuntimeTurnRunner::open(&db, &config, model, args.shell_id)?;
+    let mcp = tools::mcp_tools(&config.mcp).await;
+    let (tool_list, workspace) =
+        tools::Tools::new(&config.tools, &db, tools::search_key_from_env())
+            .with(mcp)
+            .into_parts();
+    let policy = reflex.map(|reflex_client| {
+        Arc::new(ReflexToolPolicy::new(
+            reflex_client,
+            format!("{ASSISTANT_KIND}/{}", config.owner),
+            false,
+        )) as Arc<dyn ToolPolicy>
+    });
+    let runner = RuntimeTurnRunner::open_with(
+        &db,
+        &config,
+        model,
+        args.shell_id,
+        RuntimeTurnOptions {
+            tools: tool_list,
+            workspace,
+            policy,
+            custody,
+        },
+    )?;
     let mut worker = PoolWorker::new(pool_cfg.clone(), client, runner);
     let stop = async {
         if tokio::signal::ctrl_c().await.is_err() {
@@ -538,7 +611,7 @@ async fn ask(socket: &Path, request: &Request) -> Result<bool> {
 async fn run(cli: Cli) -> Result<bool> {
     let env = Env::from_process();
     if let Command::Pool(args) = cli.command {
-        Box::pin(run_pool(args, &env)).await?;
+        Box::pin(run_pool(*args, &env)).await?;
         return Ok(true);
     }
     let socket = match cli.socket {
@@ -546,7 +619,7 @@ async fn run(cli: Cli) -> Result<bool> {
         None => env.socket()?,
     };
     match cli.command {
-        Command::Serve(args) => Box::pin(serve(socket, args, &env)).await.map(|()| true),
+        Command::Serve(args) => Box::pin(serve(socket, *args, &env)).await.map(|()| true),
         Command::Pool(_) => unreachable!("handled above"),
         Command::Chat(args) => {
             let request = Request::Chat {
@@ -602,7 +675,7 @@ mod tests {
     fn serve_args(words: &[&str]) -> ServeArgs {
         let cli = Cli::try_parse_from(words).unwrap();
         match cli.command {
-            Command::Serve(args) => args,
+            Command::Serve(args) => *args,
             _ => panic!("not serve"),
         }
     }
@@ -783,10 +856,7 @@ mod tests {
         let cli = Cli::try_parse_from(["lg", "serve", "--db", "/d"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Serve(ServeArgs {
-                model: ModelChoice::Offline,
-                ..
-            })
+            Command::Serve(ref args) if args.model == ModelChoice::Offline
         ));
     }
 

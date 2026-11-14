@@ -203,3 +203,76 @@ async fn a_failing_mcp_tool_answers_the_model() {
         "the op still ends with an answer"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reflex_red_waits_for_approval_and_never_blocks_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let web = http().await;
+    let out = server("out", &web.url, &[], ToolEffect::External);
+    let vars: Vars = Arc::new(|_: &str| None);
+    let found = littleguy_tools::mcp::connect(&[out], &vars).await;
+    assert!(found.failed.is_empty());
+
+    let mock_reflex = littleguy_stores::MockHttpTransport::new();
+    mock_reflex
+        .enqueue_json(
+            200,
+            &serde_json::json!({
+                "tier": "RED",
+                "policy": "vespertin/comms:send-external@v3",
+                "basis": "human sign-off required"
+            }),
+        )
+        .unwrap();
+    mock_reflex
+        .enqueue_json(
+            200,
+            &serde_json::json!({
+                "tier": "NEVER",
+                "policy": "protected",
+                "basis": "sealed action"
+            }),
+        )
+        .unwrap();
+
+    let reflex = littleguy::reflex_gate::ReflexClassifyClient::with_transport(
+        "http://127.0.0.1:7717",
+        Arc::new(mock_reflex),
+    )
+    .unwrap();
+    let mut config = mcp_config();
+    config.flow.rule_of_two = false;
+    let extras = Extras {
+        mcp: found.tools,
+        reflex: Some(reflex),
+        ..Extras::default()
+    };
+    let mut daemon = Daemon::open_with(
+        &dir.path().join("lg.db"),
+        &config,
+        Arc::new(MemoryModel::default()),
+        UID,
+        false,
+        extras,
+    )
+    .unwrap();
+
+    let waiting = daemon
+        .handle_request(UID, request("rfx-1", "use out__count"))
+        .await;
+    let id = waiting_id(&waiting);
+    assert_eq!(web.count.load(Ordering::SeqCst), 0);
+    let approved = daemon.handle_request(UID, Request::Approve { id }).await;
+    assert_eq!(reply_text(&approved), "got: 1");
+    assert_eq!(web.count.load(Ordering::SeqCst), 1);
+
+    let blocked = daemon
+        .handle_request(UID, request("rfx-2", "use out__count"))
+        .await;
+    assert!(matches!(blocked, Response::Reply { .. }));
+    assert_eq!(
+        web.count.load(Ordering::SeqCst),
+        1,
+        "NEVER tier must block tool execution"
+    );
+}

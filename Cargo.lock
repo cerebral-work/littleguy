@@ -3303,6 +3303,7 @@ dependencies = [
  "autumn-harvest-sqlite",
  "axum",
  "base64 0.23.1",
+ "blake3",
  "camel-api",
  "camel-builder",
  "camel-component-api",

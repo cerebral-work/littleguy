@@ -23,6 +23,7 @@ use autumn_harvest_agent::sandbox::SandboxTool;
 use autumn_harvest_agent::{
     AgentHarness, AgentProfile, BoxFuture, Rule, RunInfo, Tool, ToolCall, ToolDecision, ToolPolicy,
 };
+use littleguy::reflex_gate::{ReflexClassifyClient, ReflexToolPolicy};
 use littleguy_stores::SqliteStores;
 
 use crate::sandbox::{ASK_REASON, TOOL};
@@ -45,6 +46,10 @@ pub struct Guard {
     pub sandbox: Option<Arc<SandboxRuntime>>,
     /// Whether the Google tools are on, so each send and invite waits.
     pub google: bool,
+    /// Optional `reflexd` `/v1/classify` client (`specs/0008`).
+    pub reflex: Option<ReflexClassifyClient>,
+    /// Self-declared agent identifier sent to `reflexd` (for example `assistant/alice`).
+    pub agent_name: String,
 }
 
 impl Guard {
@@ -84,12 +89,25 @@ impl Guard {
         if let Some(runtime) = self.sandbox {
             harness = harness.tool(SandboxTool::new(runtime).shared());
         }
-        let gate = ApprovalGate::new(self.stores, run_code, self.google, &self.flow);
+        let gate: Arc<dyn ToolPolicy> = Arc::new(ApprovalGate::new(
+            Arc::clone(&self.stores),
+            run_code,
+            self.google,
+            &self.flow,
+        ));
+        let policy: Arc<dyn ToolPolicy> = match self.reflex {
+            Some(client) => Arc::new(
+                ReflexToolPolicy::new(client, self.agent_name, true)
+                    .with_inner(gate)
+                    .with_approval_store(self.stores),
+            ),
+            None => gate,
+        };
         if !self.flow.is_empty() {
             harness = harness.flow_rules(self.flow);
         }
         (
-            harness.policy(Arc::new(gate)),
+            harness.policy(policy),
             profile.approval_timeout(self.timeout),
         )
     }

@@ -49,6 +49,7 @@ use crate::chats::Chats;
 use crate::oauth::Connections;
 use crate::pairs::{Entry, PairStore};
 use crate::protocol::{MAX_REQUEST_BYTES, PairEntry, Request, Response};
+use littleguy::reflex_gate::ReflexClassifyClient;
 use littleguy::wake::{WakeListener, cortex_wake_notice};
 
 /// The channel id of the local socket.
@@ -163,6 +164,16 @@ pub fn routing(
     Ok(table)
 }
 
+/// Warns when `approvals.approver` names a chat service that is currently off.
+fn warn_if_approver_offline(approver: Option<&SenderId>, services: &[Service]) {
+    let approver_on = approver
+        .and_then(|sender| Service::split_sender(sender.as_str()))
+        .is_some_and(|(service, _)| services.contains(&service));
+    if approver.is_some() && !approver_on {
+        tracing::warn!("approvals.approver is set, but its chat is off: decide with `lg approve`");
+    }
+}
+
 /// The config section of `service`.
 const fn chat_config(config: &Config, service: Service) -> &littleguy_core::ChatConfig {
     match service {
@@ -275,6 +286,8 @@ pub struct Extras {
     pub google: Option<Arc<dyn littleguy_tools::google::GoogleApi>>,
     /// The Slack channel takes messages.
     pub slack: bool,
+    /// Optional `reflexd` `/v1/classify` client (`specs/0008`).
+    pub reflex: Option<ReflexClassifyClient>,
 }
 
 /// The daemon state: the runtime, the routing table and the pairings.
@@ -381,7 +394,11 @@ impl Daemon {
                 .with(google);
         tracing::info!(tools = ?tools.names(), "the assistant tools");
         let flow = config.flow.rules();
-        let asks = crate::guard::Guard::asks(&flow, tools.all(), runtime.is_some() || google_on);
+        let asks = crate::guard::Guard::asks(
+            &flow,
+            tools.all(),
+            runtime.is_some() || google_on || extras.reflex.is_some(),
+        );
         let stores = if config.memory.enabled || config.brief.is_some() || asks {
             Some(crate::memory::open(db)?)
         } else {
@@ -410,17 +427,11 @@ impl Daemon {
             flow,
             sandbox: runtime,
             google: google_on,
+            reflex: extras.reflex,
+            agent_name: format!("{ASSISTANT_KIND}/{}", config.owner),
         });
         let approver = config.approvals.approver.clone();
-        let approver_on = approver
-            .as_ref()
-            .and_then(|sender| Service::split_sender(sender.as_str()))
-            .is_some_and(|(service, _)| services.contains(&service));
-        if approver.is_some() && !approver_on {
-            tracing::warn!(
-                "approvals.approver is set, but its chat is off: decide with `lg approve`"
-            );
-        }
+        warn_if_approver_offline(approver.as_ref(), &services);
         let memory = stores
             .filter(|_| config.memory.enabled)
             .map(|stores| (stores, db));

@@ -1,7 +1,9 @@
-//! Library surface of `littleguy`, exposing [`mandate_bridge`], [`orchestration`], [`pool`], [`rule_of_two`], [`secret_file`], and [`wake`] alongside the `lg` daemon binary.
+//! Library surface of `littleguy`, exposing [`custody`], [`mandate_bridge`], [`orchestration`], [`pool`], [`reflex_gate`], [`rule_of_two`], [`secret_file`], and [`wake`] alongside the `lg` daemon binary.
 
+pub mod custody;
 pub mod mandate_bridge;
 pub mod pool;
+pub mod reflex_gate;
 pub mod secret_file;
 pub mod wake;
 pub use littleguy_core::orchestration;

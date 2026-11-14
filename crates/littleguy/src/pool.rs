@@ -8,13 +8,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest_agent::model::BoxFuture;
-use autumn_harvest_agent::{AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, sqlite};
+use autumn_harvest_agent::{
+    AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, DirWorkspaceBlobs, Tool, ToolPolicy,
+    WorkspaceStore, sqlite,
+};
 use autumn_harvest_sqlite::SqliteRuntime;
 use littleguy_core::{
-    ASSISTANT_KIND, AuthorityGrant, BiscuitMandateClaims, Config, DeliveryToken, EstateSubject,
-    GhostBinding, LittleguySeatSubstrate, PoolPeerId, ReversibilityClass, RoleName, SandboxClass,
-    SeatJobSpec, SeatReceipt, ShellId, TaskId, WheelhorseGate,
+    ASSISTANT_KIND, AuthorityGrant, BiscuitMandateClaims, BlackwallProject, Config, DeliveryToken,
+    EstateSubject, GhostBinding, LittleguySeatSubstrate, PoolPeerId, ReversibilityClass, RoleName,
+    SandboxClass, SeatJobSpec, SeatReceipt, ShellId, TaskId, WheelhorseGate,
 };
 use littleguy_stores::{
     AdapterError, HttpMethod, HttpTransport, ReqwestHttpTransport, StoreHttpRequest,
@@ -25,6 +29,7 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::sync::Notify;
 
+use crate::custody::{BLACKWALL_CUSTODY_LABEL, BlackwallCustodyClient};
 use crate::secret_file::{SecretFile, SecretFileError};
 use crate::wake::MAX_WAKE_LINE_BYTES;
 
@@ -525,6 +530,8 @@ pub struct TurnInput {
     pub prompt: String,
     /// Validated GHOST binding when the delivery carries a non-null binding.
     pub ghost_binding: Option<GhostBinding>,
+    /// Optional validated Blackwall project override from the delivery JSON body (`specs/0008`).
+    pub project: Option<BlackwallProject>,
 }
 
 /// Completed turn output returned by [`TurnRunner::run_turn`].
@@ -536,6 +543,8 @@ pub struct TurnOutput {
     pub transcript_sha256: String,
     /// Completed seat receipt from `LittleguySeatSubstrate`.
     pub receipt: SeatReceipt,
+    /// Optional 64-character lowercase BLAKE3 `run_hash` imported into `blackwall-serve` (`specs/0008`).
+    pub run_hash: Option<String>,
 }
 
 /// Failure classification returned by [`TurnRunner::run_turn`].
@@ -571,6 +580,32 @@ struct RuntimeState {
     substrate: LittleguySeatSubstrate,
     owner: String,
     work_dir: PathBuf,
+    model_label: String,
+    custody: Option<BlackwallCustodyClient>,
+}
+
+/// Optional tool, policy, and custody attachments for [`RuntimeTurnRunner::open_with`].
+#[derive(Default)]
+pub struct RuntimeTurnOptions {
+    /// Tools registered on the pool turn harness.
+    pub tools: Vec<Arc<dyn Tool>>,
+    /// Optional workspace snapshot directory when file tools are enabled.
+    pub workspace: Option<PathBuf>,
+    /// Optional pre-tool policy (such as [`crate::reflex_gate::ReflexToolPolicy`]).
+    pub policy: Option<Arc<dyn ToolPolicy>>,
+    /// Optional Blackwall run-custody client (`specs/0008`).
+    pub custody: Option<BlackwallCustodyClient>,
+}
+
+impl fmt::Debug for RuntimeTurnOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeTurnOptions")
+            .field("tool_count", &self.tools.len())
+            .field("workspace", &self.workspace)
+            .field("policy", &self.policy.is_some())
+            .field("custody", &self.custody)
+            .finish()
+    }
 }
 
 /// Production [`TurnRunner`] backed by `LittleguySeatSubstrate` and single-writer `SqliteRuntime`.
@@ -599,15 +634,43 @@ impl RuntimeTurnRunner {
         model: Arc<dyn AgentModel>,
         shell_id: ShellId,
     ) -> Result<Self, PoolError> {
+        Self::open_with(db, config, model, shell_id, RuntimeTurnOptions::default())
+    }
+
+    /// Opens the single-writer SQLite runtime at `db` with optional tools, policy, and custody (`specs/0008`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError::Runtime`] when `db` cannot be opened or `config.owner` is invalid.
+    pub fn open_with(
+        db: &Path,
+        config: &Config,
+        model: Arc<dyn AgentModel>,
+        shell_id: ShellId,
+        options: RuntimeTurnOptions,
+    ) -> Result<Self, PoolError> {
         let parent = db.parent().filter(|p| !p.as_os_str().is_empty());
         if let Some(dir) = parent {
             std::fs::create_dir_all(dir).map_err(|e| PoolError::Runtime(e.to_string()))?;
         }
         let mut rt = SqliteRuntime::open(db).map_err(|e| PoolError::Runtime(e.to_string()))?;
-        let profile = AgentProfile::new(ASSISTANT_KIND)
+        let model_label = model.model_id().unwrap_or("littleguy").to_owned();
+        let mut profile = AgentProfile::new(ASSISTANT_KIND)
             .system(config.system.as_str())
             .window(config.window);
-        sqlite::register(&mut rt, Arc::new(AgentHarness::new(model).agent(profile)));
+        let mut harness = AgentHarness::new(model);
+        if !options.tools.is_empty() {
+            harness = harness.tools(options.tools);
+        }
+        if let Some(root) = options.workspace {
+            let blobs = Arc::new(DirWorkspaceBlobs::new(root));
+            harness = harness.workspace(WorkspaceStore::new(blobs, PayloadCodecs::default()));
+            profile = profile.workspace();
+        }
+        if let Some(policy) = options.policy {
+            harness = harness.policy(policy);
+        }
+        sqlite::register(&mut rt, Arc::new(harness.agent(profile)));
         let agent_id = AgentId::new(ASSISTANT_KIND, config.owner.as_str())
             .map_err(|e| PoolError::Runtime(e.to_string()))?;
         let work_dir = parent.unwrap_or_else(|| Path::new(".")).to_path_buf();
@@ -621,6 +684,8 @@ impl RuntimeTurnRunner {
                 substrate,
                 owner,
                 work_dir,
+                model_label,
+                custody: options.custody,
             })),
         })
     }
@@ -671,6 +736,26 @@ async fn run_turn_locked(
             return Err(err);
         }
     };
+    let run_hash = match &st.custody {
+        Some(custody) => match custody
+            .import_turn(
+                &input.prompt,
+                &st.model_label,
+                &answer,
+                input.project.as_ref(),
+            )
+            .await
+        {
+            Ok(hash) => Some(hash),
+            Err(err) => {
+                let _ = st.substrate.cancel(&seat, &job_id);
+                let _ = st.substrate.release(&seat);
+                drop(st);
+                return Err(err);
+            }
+        },
+        None => None,
+    };
     let transcript = json!({
         "task_id": input.task_id.as_str(), "attempt": input.attempt,
         "shell_id": input.shell_id.as_str(), "prompt": &input.prompt, "answer": &answer,
@@ -689,6 +774,7 @@ async fn run_turn_locked(
         answer,
         transcript_sha256: sha,
         receipt,
+        run_hash,
     })
 }
 
@@ -1183,9 +1269,9 @@ fn validate_delivery(raw: &RawDelivery, config: &PoolConfig) -> Result<TurnInput
     {
         return Err("refused: refs exceed 16 KiB size cap".into());
     }
-    let (prompt, body_ghost, body_task) = parse_body_envelope(body)?;
+    let envelope = parse_body_envelope(body)?;
     let refs_ghost = parse_optional_ghost(refs_val.get("ghost_binding"))?;
-    if let (Some(a), Some(b)) = (&body_ghost, &refs_ghost)
+    if let (Some(a), Some(b)) = (&envelope.ghost_binding, &refs_ghost)
         && a != b
     {
         return Err("refused: conflicting ghost_binding in body and refs".into());
@@ -1193,7 +1279,7 @@ fn validate_delivery(raw: &RawDelivery, config: &PoolConfig) -> Result<TurnInput
     let raw_task = refs_val
         .get("task_id")
         .and_then(Value::as_str)
-        .or(body_task.as_deref())
+        .or(envelope.task_id.as_deref())
         .ok_or("refused: missing task_id")?;
     let task_id = TaskId::new(raw_task).map_err(|e| format!("refused: invalid task_id: {e}"))?;
     let attempt = parse_attempt(refs_val.get("attempt"), raw.delivery_attempt)?;
@@ -1201,14 +1287,20 @@ fn validate_delivery(raw: &RawDelivery, config: &PoolConfig) -> Result<TurnInput
         task_id,
         attempt,
         shell_id: config.shell_id.clone(),
-        prompt,
-        ghost_binding: body_ghost.or(refs_ghost),
+        prompt: envelope.prompt,
+        ghost_binding: envelope.ghost_binding.or(refs_ghost),
+        project: envelope.project,
     })
 }
 
-fn parse_body_envelope(
-    body: &str,
-) -> Result<(String, Option<GhostBinding>, Option<String>), String> {
+struct ParsedEnvelope {
+    prompt: String,
+    ghost_binding: Option<GhostBinding>,
+    task_id: Option<String>,
+    project: Option<BlackwallProject>,
+}
+
+fn parse_body_envelope(body: &str) -> Result<ParsedEnvelope, String> {
     if body.trim_start().starts_with('{') {
         let map: Map<String, Value> =
             serde_json::from_str(body).map_err(|e| format!("refused: malformed JSON body: {e}"))?;
@@ -1219,19 +1311,37 @@ fn parse_body_envelope(
             .filter(|s| !s.trim().is_empty())
             .ok_or("refused: missing prompt")?
             .to_owned();
-        let ghost = parse_optional_ghost(map.get("ghost_binding"))?;
-        return Ok((
+        let ghost_binding = parse_optional_ghost(map.get("ghost_binding"))?;
+        let project = parse_optional_project(map.get("project"))?;
+        return Ok(ParsedEnvelope {
             prompt,
-            ghost,
-            map.get("task_id")
+            ghost_binding,
+            task_id: map
+                .get("task_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-        ));
+            project,
+        });
     }
     if body.trim().is_empty() {
         return Err("refused: empty prompt".into());
     }
-    Ok((body.to_owned(), None, None))
+    Ok(ParsedEnvelope {
+        prompt: body.to_owned(),
+        ghost_binding: None,
+        task_id: None,
+        project: None,
+    })
+}
+
+fn parse_optional_project(val: Option<&Value>) -> Result<Option<BlackwallProject>, String> {
+    match val {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => BlackwallProject::new(raw.as_str())
+            .map(Some)
+            .map_err(|e| format!("refused: invalid project: {e}")),
+        Some(_) => Err("refused: invalid project: expected string".into()),
+    }
 }
 
 fn parse_optional_ghost(val: Option<&Value>) -> Result<Option<GhostBinding>, String> {
@@ -1283,11 +1393,19 @@ fn base_refs(input: &TurnInput, stream_seq: u64, outcome: &str) -> Map<String, V
 fn build_ok_reply(input: &TurnInput, out: &TurnOutput, stream_seq: u64) -> CachedReply {
     let mut refs = base_refs(input, stream_seq, "ok"); // escapement-serve/src/pool.rs:999
     refs.insert("transcript_sha256".into(), json!(&out.transcript_sha256));
+    if let Some(run_hash) = &out.run_hash {
+        refs.insert("run_hash".into(), json!(run_hash));
+    }
     let make = |ans: &str| {
         let mut obj = Map::new();
+        obj.insert("exit".into(), json!("ok"));
         obj.insert("answer".into(), json!(ans));
         obj.insert("shell_id".into(), json!(input.shell_id.as_str()));
         obj.insert("transcript_sha256".into(), json!(&out.transcript_sha256));
+        if let Some(run_hash) = &out.run_hash {
+            obj.insert("run_hash".into(), json!(run_hash));
+            obj.insert("custody".into(), json!(BLACKWALL_CUSTODY_LABEL));
+        }
         if let Some(b) = &input.ghost_binding {
             obj.insert("ghost_id".into(), json!(b.ghost_id()));
             obj.insert("molt_epoch".into(), json!(b.molt_epoch()));
@@ -1323,7 +1441,12 @@ fn build_failed_reply(input: &TurnInput, stream_seq: u64, error: &str) -> Cached
     let mut refs = base_refs(input, stream_seq, "failed"); // escapement-serve/src/pool.rs:1021
     refs.insert("transient".into(), json!(false)); // escapement-serve/src/pool.rs:1033
     refs.insert("error".into(), json!(short_err)); // escapement-serve/src/pool.rs:1040
-    let body = json!({ "error": short_err, "shell_id": input.shell_id.as_str() }).to_string();
+    let body = json!({
+        "exit": "err",
+        "error": short_err,
+        "shell_id": input.shell_id.as_str(),
+    })
+    .to_string();
     CachedReply {
         outcome: "failed",
         body,

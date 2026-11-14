@@ -23,8 +23,8 @@ pub use ghost_binding::{
     GhostBinding, GhostBindingError, GhostBindingWire, GhostLifecycleState, GhostManifestation,
 };
 pub use ids::{
-    ChannelId, DeliveryToken, IdError, MAX_DELIVERY_TOKEN_BYTES, MessageId, OwnerName, PoolPeerId,
-    RoleName, SenderId, ShellId, TaskId, WakeMessageId,
+    BlackwallProject, ChannelId, DeliveryToken, IdError, MAX_DELIVERY_TOKEN_BYTES, MessageId,
+    OwnerName, PoolPeerId, RoleName, SenderId, ShellId, TaskId, WakeMessageId,
 };
 pub use mandate_bridge::{
     BiscuitMandateClaims, ConstitutionalSealedAction, ESTATE_TRUST_DOMAIN, MandateBridgeError,

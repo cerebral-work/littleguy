@@ -128,6 +128,12 @@ impl Tools {
         self.tools.iter().map(|tool| tool.name()).collect()
     }
 
+    /// Unpacks the tool list and optional workspace snapshot directory.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<Arc<dyn Tool>>, Option<PathBuf>) {
+        (self.tools, self.workspace)
+    }
+
     /// Gives the harness the tools and the workspace store, and the
     /// profile a workspace.
     #[must_use]
