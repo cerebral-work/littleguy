@@ -1,13 +1,21 @@
 # Builds, scans, pushes, signs, and attests `harbor.unsigned.gg/platform/littleguy`
 # (`specs/0006`, `REQ-LG-CONT-03`).
 #
+# Nothing builds on the runner: `publish` runs on an in-cluster runner and a rootless
+# BuildKit Job in `ci-builds`, rendered from the published `image-build` chart, builds
+# and pushes the image. Harbor is not reachable from GitHub-hosted runners.
+#
 # Required secrets in GitHub Environment `harbor-publish` (restricted by branch
 # policy to `main`; operator-gated; while any secret is absent, the `preflight`
 # job emits `ready=false` and `publish` skips cleanly without failing CI):
 #   - HARBOR_PLATFORM_PUSH_USERNAME
 #   - HARBOR_PLATFORM_PUSH_PASSWORD
+#   - HARBOR_HELM_PUSH_USERNAME (pulls the image-build chart)
+#   - HARBOR_HELM_PUSH_PASSWORD
 #   - COSIGN_PRIVATE_KEY
 #   - COSIGN_PASSWORD
+#   - KUBECONFIG_CI_BUILDS (kubeconfig for namespace ci-builds)
+#   - RELEASE_BOT_PRIVATE_KEY (with variable RELEASE_BOT_APP_ID; mints the clone token)
 # Optional secret in GitHub Environment `harbor-publish`:
 #   - KYVERNO_COSIGN_PUBLIC_KEY (when set, verifies signature and attestation
 #     against the cluster admission public key in addition to the key's own
@@ -31,6 +39,8 @@ concurrency:
 env:
   HARBOR_REGISTRY: harbor.unsigned.gg
   IMAGE_REPO: harbor.unsigned.gg/platform/littleguy
+  BUILD_NAMESPACE: ci-builds
+  IMAGE_BUILD_CHART_VERSION: 0.2.1
 
 jobs:
   preflight:
@@ -56,6 +66,11 @@ jobs:
           HAS_HARBOR_PASS: ${{ secrets.HARBOR_PLATFORM_PUSH_PASSWORD != '' }}
           HAS_COSIGN_KEY: ${{ secrets.COSIGN_PRIVATE_KEY != '' }}
           HAS_COSIGN_PASS: ${{ secrets.COSIGN_PASSWORD != '' }}
+          HAS_HELM_USER: ${{ secrets.HARBOR_HELM_PUSH_USERNAME != '' }}
+          HAS_HELM_PASS: ${{ secrets.HARBOR_HELM_PUSH_PASSWORD != '' }}
+          HAS_KUBECONFIG: ${{ secrets.KUBECONFIG_CI_BUILDS != '' }}
+          HAS_BOT_KEY: ${{ secrets.RELEASE_BOT_PRIVATE_KEY != '' }}
+          HAS_BOT_ID: ${{ vars.RELEASE_BOT_APP_ID != '' }}
           WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
           WORKFLOW_RUN_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -79,6 +94,11 @@ jobs:
           [ "$HAS_HARBOR_PASS" = "true" ] || missing="$missing HARBOR_PLATFORM_PUSH_PASSWORD"
           [ "$HAS_COSIGN_KEY" = "true" ] || missing="$missing COSIGN_PRIVATE_KEY"
           [ "$HAS_COSIGN_PASS" = "true" ] || missing="$missing COSIGN_PASSWORD"
+          [ "$HAS_HELM_USER" = "true" ] || missing="$missing HARBOR_HELM_PUSH_USERNAME"
+          [ "$HAS_HELM_PASS" = "true" ] || missing="$missing HARBOR_HELM_PUSH_PASSWORD"
+          [ "$HAS_KUBECONFIG" = "true" ] || missing="$missing KUBECONFIG_CI_BUILDS"
+          [ "$HAS_BOT_KEY" = "true" ] || missing="$missing RELEASE_BOT_PRIVATE_KEY"
+          [ "$HAS_BOT_ID" = "true" ] || missing="$missing vars.RELEASE_BOT_APP_ID"
           if [ -n "$missing" ]; then
             echo "::notice::Skipping Harbor publish for $target_sha; unseeded Environment harbor-publish secrets:$missing"
             echo "ready=false" >> "$GITHUB_OUTPUT"
@@ -90,13 +110,13 @@ jobs:
     name: Build, scan, push, sign, and attest image
     needs: preflight
     if: needs.preflight.outputs.ready == 'true'
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [self-hosted]}
     environment: harbor-publish
-    timeout-minutes: 60
+    timeout-minutes: 90
     outputs:
       digest: ${{ steps.sign.outputs.digest }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: unsigned-gg/actions/vendor/actions-checkout@fd981ada61381db6416ba67b2bbd2d779823d0b5 # v7.0.1
         with:
           ref: ${{ needs.preflight.outputs.sha }}
           fetch-depth: 0
@@ -112,7 +132,7 @@ jobs:
           fi
           git merge-base --is-ancestor "$TARGET_SHA" refs/remotes/origin/main
 
-      - name: Install SHA-256 pinned crane, cosign, trivy, and syft
+      - name: Install SHA-256 pinned crane, cosign, trivy, syft, helm, and kubectl
         run: |
           set -euo pipefail
           bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
@@ -131,6 +151,8 @@ jobs:
           inst cosign https://github.com/sigstore/cosign/releases/download/v2.6.1/cosign-linux-amd64 064954c5d8c7e3b28188eee5b1727b31c411550bc5fefd41aa672d3c761d103a
           inst trivy https://github.com/aquasecurity/trivy/releases/download/v0.70.0/trivy_0.70.0_Linux-64bit.tar.gz 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9 trivy
           inst syft https://github.com/anchore/syft/releases/download/v1.55.0/syft_1.55.0_linux_amd64.tar.gz bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d syft
+          inst helm https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz fc307327959aa38ed8f9f7e66d45492bb022a66c3e5da6063958254b9767d179 linux-amd64/helm
+          inst kubectl https://dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl 7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3
           echo "$bin" >> "$GITHUB_PATH"
 
       - name: Preflight Harbor robot scope and log in
@@ -154,36 +176,94 @@ jobs:
               exit 1 ;;
           esac
           dc="$RUNNER_TEMP/docker"; mkdir -p "$dc"
-          printf '%s' "$PUSH_PASS" | DOCKER_CONFIG="$dc" docker login "$HARBOR_REGISTRY" -u "$PUSH_USER" --password-stdin
+          printf '%s' "$PUSH_PASS" | DOCKER_CONFIG="$dc" crane auth login "$HARBOR_REGISTRY" -u "$PUSH_USER" --password-stdin
           {
             echo "SHORT=${TARGET_SHA:0:12}"
             echo "SHORT7=${TARGET_SHA:0:7}"
             echo "VER=$ver"
-            echo "LOCAL_TAG=littleguy:local-${TARGET_SHA:0:12}"
             echo "DOCKER_CONFIG=$dc"
           } >> "$GITHUB_ENV"
 
-      - name: Build, smoke-check non-root runtime, and scan with Trivy before push
+      - name: Mint the clone token (contents read only, on this repository)
+        id: clone
+        uses: unsigned-gg/actions/vendor/actions-create-github-app-token@fd981ada61381db6416ba67b2bbd2d779823d0b5 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+
+      - name: Stage the clone token in ci-builds
         env:
+          KCFG: ${{ secrets.KUBECONFIG_CI_BUILDS }}
+          TOKEN: ${{ steps.clone.outputs.token }}
+        run: |
+          set -euo pipefail
+          install -m 600 /dev/null "$RUNNER_TEMP/kubeconfig"; printf '%s' "$KCFG" > "$RUNNER_TEMP/kubeconfig"
+          secret="build-git-$GITHUB_RUN_ID"
+          { echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig"; echo "CLONE_SECRET=$secret"; } >> "$GITHUB_ENV"
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          kubectl -n "$BUILD_NAMESPACE" delete secret "$secret" --ignore-not-found
+          printf '%s' "$TOKEN" | kubectl -n "$BUILD_NAMESPACE" create secret generic "$secret" --from-file=git-token=/dev/stdin
+
+      - name: Build and push the image in a BuildKit Job
+        env:
+          HELM_USER: ${{ secrets.HARBOR_HELM_PUSH_USERNAME }}
+          HELM_PASS: ${{ secrets.HARBOR_HELM_PUSH_PASSWORD }}
+          REPO: ${{ github.repository }}
           TARGET_SHA: ${{ needs.preflight.outputs.sha }}
         run: |
           set -euo pipefail
-          docker build \
-            --label "org.opencontainers.image.revision=$TARGET_SHA" \
-            --label "org.opencontainers.image.version=$VER" \
-            -t "$LOCAL_TAG" .
-          test "$(docker inspect -f '{{.Config.User}}' "$LOCAL_TAG")" = "65532:65532"
-          test "$(docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges --entrypoint /usr/bin/id "$LOCAL_TAG" -u)" = "65532"
-          docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges "$LOCAL_TAG" --version
+          export HELM_REGISTRY_CONFIG="$RUNNER_TEMP/helm-registry.json"
+          echo "HELM_REGISTRY_CONFIG=$HELM_REGISTRY_CONFIG" >> "$GITHUB_ENV"
+          printf '%s' "$HELM_PASS" | helm registry login "$HARBOR_REGISTRY" -u "$HELM_USER" --password-stdin
+          git_ref="$IMAGE_REPO:git-$SHORT"
+          job="image-build-littleguy-$SHORT"
+          if crane digest "$git_ref" >/dev/null 2>&1; then
+            echo "$git_ref already exists; not rebuilding"
+            exit 0
+          fi
+          # Push through the in-cluster Traefik service, not the Cloudflare edge (OPS-1425).
+          ip=$(getent hosts traefik.traefik.svc.cluster.local | awk '{print $1; exit}')
+          [ -n "$ip" ] || { echo "::error::cannot resolve traefik.traefik.svc.cluster.local"; exit 1; }
+          helm template image-build "oci://$HARBOR_REGISTRY/helm-charts/image-build" --version "$IMAGE_BUILD_CHART_VERSION" \
+            --show-only templates/job.yaml \
+            --set build.enabled=true --set build.name="littleguy-$SHORT" --set build.registryRoute.ip="$ip" \
+            --set build.git.repository="https://github.com/$REPO.git" --set build.git.revision="$TARGET_SHA" \
+            --set build.git.credentialsSecret="$CLONE_SECRET" --set build.dockerfile="Dockerfile" \
+            --set build.cache.ref="$HARBOR_REGISTRY/platform/buildkit-cache:littleguy" \
+            --set "build.destinations[0]=$git_ref" \
+            --set "build.extraArgs[0]=--opt=label:org.opencontainers.image.revision=$TARGET_SHA" \
+            --set "build.extraArgs[1]=--opt=label:org.opencontainers.image.version=$VER" \
+            --set build.activeDeadlineSeconds=3600 > "$RUNNER_TEMP/littleguy.yaml"
+          kubectl -n "$BUILD_NAMESPACE" delete "job/$job" --ignore-not-found --cascade=foreground --timeout=120s
+          kubectl -n "$BUILD_NAMESPACE" create -f "$RUNNER_TEMP/littleguy.yaml"
+          state=pending
+          for _ in $(seq 1 240); do
+            s=$(kubectl -n "$BUILD_NAMESPACE" get "job/$job" -o jsonpath='{.status.succeeded}/{.status.failed}') || s=""
+            case "$s" in 1/*) state=ok; break ;; */[1-9]*) state=failed; break ;; esac
+            sleep 15
+          done
+          kubectl -n "$BUILD_NAMESPACE" logs "job/$job" --all-containers --tail=100 || true
+          [ "$state" = ok ] || { echo "::error::BuildKit Job $job ended in state $state"; exit 1; }
+
+      - name: Check non-root runtime config and scan with Trivy before signing
+        run: |
+          set -euo pipefail
+          dig=$(crane digest "$IMAGE_REPO:git-$SHORT")
+          [[ "$dig" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::$IMAGE_REPO:git-$SHORT has no digest"; exit 1; }
+          ref="$IMAGE_REPO@$dig"
+          test "$(crane config "$ref" | jq -r '.config.User')" = "65532:65532"
           {
             echo "### littleguy git-$SHORT ($VER)"
             echo '```'
-            trivy image -q --severity HIGH,CRITICAL --exit-code 0 "$LOCAL_TAG"
+            trivy image -q --severity HIGH,CRITICAL --exit-code 0 "$ref"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          trivy image -q --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$LOCAL_TAG"
+          trivy image -q --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$ref"
 
-      - name: Push immutable tags, sign digest, and attach CycloneDX SBOM
+      - name: Tag, sign digest, and attach CycloneDX SBOM
         id: sign
         env:
           COSIGN_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
@@ -202,10 +282,6 @@ jobs:
 
           git_ref="$IMAGE_REPO:git-$SHORT"
           ver_ref="$IMAGE_REPO:$VER-$SHORT7"
-          if ! crane digest "$git_ref" >/dev/null 2>&1; then
-            docker tag "$LOCAL_TAG" "$git_ref"
-            docker push "$git_ref"
-          fi
           dig=$(crane digest "$git_ref")
           [[ "$dig" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::$git_ref returned invalid digest '$dig'"; exit 1; }
           if ! crane digest "$ver_ref" >/dev/null 2>&1; then
@@ -235,4 +311,7 @@ jobs:
       - name: Clean up temporary credentials
         if: always()
         run: |
-          rm -rf "$RUNNER_TEMP/docker" "$RUNNER_TEMP/harbor.netrc" "$RUNNER_TEMP/cosign.key" "$RUNNER_TEMP/cosign.pub" "$RUNNER_TEMP/kyverno.pub" "$RUNNER_TEMP/littleguy.tar" || true
+          if [ -n "${CLONE_SECRET:-}" ] && ! KUBECONFIG="$RUNNER_TEMP/kubeconfig" kubectl -n "$BUILD_NAMESPACE" delete secret "$CLONE_SECRET" --ignore-not-found; then
+            echo "::warning::clone Secret $CLONE_SECRET was not deleted from $BUILD_NAMESPACE; its token expires within one hour"
+          fi
+          rm -rf "$RUNNER_TEMP/docker" "$RUNNER_TEMP/harbor.netrc" "$RUNNER_TEMP/cosign.key" "$RUNNER_TEMP/cosign.pub" "$RUNNER_TEMP/kyverno.pub" "$RUNNER_TEMP/helm-registry.json" "$RUNNER_TEMP/kubeconfig" "$RUNNER_TEMP/littleguy.yaml" || true
